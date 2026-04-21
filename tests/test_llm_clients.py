@@ -126,6 +126,55 @@ def test_ollama_client_uses_digest_when_available(monkeypatch: pytest.MonkeyPatc
     assert result.model_id == "qwen2.5:7b@sha256abcdef"
 
 
+def test_ollama_client_passes_think_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Qwen3 系は think=False を渡さないと response が空になる (F-016 拡張)."""
+    import chunking.llm.ollama_client as mod
+
+    captured: dict = {}
+
+    class _FakeClient:
+        def show(self, tag: str) -> dict:
+            return {"details": {"digest": "sha"}}
+
+        def generate(self, **kwargs) -> dict:
+            captured.update(kwargs)
+            return {"response": "ok", "eval_count": 1, "done_reason": "stop"}
+
+    monkeypatch.setattr(mod, "ollama", _FakeClient())
+    mod.OllamaLLMClient(model="qwen3:8b").generate("x", max_tokens=10)
+    assert captured.get("think") is False
+
+    captured.clear()
+    mod.OllamaLLMClient(model="qwen3:8b", think=True).generate("x", max_tokens=10)
+    assert captured.get("think") is True
+
+
+def test_ollama_client_falls_back_when_think_kwarg_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ollama-python <0.4 では think kwarg 未対応 → TypeError fallback."""
+    import chunking.llm.ollama_client as mod
+
+    call_log: list[dict] = []
+
+    class _FakeClient:
+        def show(self, tag: str) -> dict:
+            return {"details": {"digest": "sha"}}
+
+        def generate(self, **kwargs) -> dict:
+            call_log.append(kwargs)
+            if "think" in kwargs:
+                raise TypeError("generate() got an unexpected keyword argument 'think'")
+            return {"response": "ok", "eval_count": 1, "done_reason": "stop"}
+
+    monkeypatch.setattr(mod, "ollama", _FakeClient())
+    result = mod.OllamaLLMClient(model="qwen3:8b").generate("x", max_tokens=10)
+    assert result.text == "ok"
+    assert len(call_log) == 2
+    assert "think" in call_log[0]
+    assert "think" not in call_log[1]
+
+
 def test_ollama_client_falls_back_to_modelfile_hash(monkeypatch: pytest.MonkeyPatch) -> None:
     import chunking.llm.ollama_client as mod
 

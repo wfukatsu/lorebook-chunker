@@ -15,6 +15,7 @@ from chunking.llm import (
 DEFAULT_MODEL = "qwen2.5:7b-instruct-q4_K_M"
 DEFAULT_SYSTEM_PROMPT = "あなたは日本語の正確な要約を書くアシスタントです。"
 DEFAULT_TIMEOUT_SECONDS = 60.0
+DEFAULT_THINK = False
 
 
 class OllamaLLMClient:
@@ -25,6 +26,10 @@ class OllamaLLMClient:
 
     F-016: daemon ハング耐性のため ``timeout_seconds`` を設け、HTTP クライアントと
     generate の両方に適用する. タイムアウトは ``LLMRetryableError`` として扱う.
+
+    Qwen3 互換: Qwen3 系モデルは既定で内部 reasoning に全トークンを消費し、
+    ``response`` が空になる. ``think=False`` を渡すと最終出力のみ返すため、
+    要約用途の既定値として ``think=False`` を採用する.
     """
 
     def __init__(
@@ -34,10 +39,12 @@ class OllamaLLMClient:
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         host: str | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        think: bool = DEFAULT_THINK,
     ) -> None:
         self._system_prompt = system_prompt
         self._model_tag = model
         self._timeout_seconds = timeout_seconds
+        self._think = think
         # F-016: ollama.Client は timeout kwarg を受け付ける.
         # host 指定時は Client を構築し timeout を渡す. 未指定時は既定動作維持 (module をそのまま使う)
         # — テスト容易性のためと、後方互換のため.
@@ -69,12 +76,21 @@ class OllamaLLMClient:
     def generate(self, prompt: str, max_tokens: int) -> GenerateResult:
         full_prompt = f"{self._system_prompt}\n\n{prompt}" if self._system_prompt else prompt
         try:
-            response = self._client.generate(
-                model=self._model_tag,
-                prompt=full_prompt,
-                options={"num_predict": max_tokens},
-                stream=False,
-            )
+            try:
+                response = self._client.generate(
+                    model=self._model_tag,
+                    prompt=full_prompt,
+                    options={"num_predict": max_tokens},
+                    stream=False,
+                    think=self._think,
+                )
+            except TypeError:  # ollama-python <0.4 does not accept think=; fall back.
+                response = self._client.generate(
+                    model=self._model_tag,
+                    prompt=full_prompt,
+                    options={"num_predict": max_tokens},
+                    stream=False,
+                )
         except ConnectionError as e:
             raise LLMRetryableError(f"ollama connection error: {e}") from e
         except TimeoutError as e:
