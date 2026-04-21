@@ -129,7 +129,10 @@ def test_chunker_rejects_invalid_params() -> None:
         Chunker(simple_japanese_splitter, target_chars=500, max_chunk_chars=100)
 
 
-def test_row_index_is_zero_based_and_sequential() -> None:
+def test_row_index_is_sentinel_until_ingest_assigns() -> None:
+    """chunker は row_index=-1 (sentinel) を埋め、ingest 側でコーパス全体の
+    グローバルな index に振り直す。これは F-001 の固定: per-document な row_index が
+    マルチドキュメント ingest で TF-IDF row を取り違えていた問題の修正。"""
     chunker = _build_chunker(target_chars=30)
     text = (
         "あいうえおかきくけこ。"
@@ -138,8 +141,8 @@ def test_row_index_is_zero_based_and_sequential() -> None:
         "まみむめもやゆよらり。"
     )
     chunks = list(chunker.chunk_document("a.txt", text))
-    row_indices = [c.row_index for c in chunks]
-    assert row_indices == list(range(len(chunks)))
+    assert len(chunks) > 0
+    assert all(c.row_index == -1 for c in chunks)
 
 
 def test_source_posix_relative_normalization() -> None:

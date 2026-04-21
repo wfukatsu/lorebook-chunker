@@ -17,6 +17,7 @@ import yaml
 from chunking.ingest import IngestConfig, IngestRunner, run_ingest
 from chunking.lint import FATAL, run_lint_impl
 from chunking.query import run_query_impl
+from chunking.schema import EntityMention
 from tests.test_ingest import _ScriptedLLM, _StubAnalyzer
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -57,9 +58,9 @@ def _ingest_fixture(tmp_path: Path, *, skip_wiki: bool = True) -> Path:
     )
     analyzer = _StubAnalyzer(
         {
-            "田中": [__import__("chunking.schema", fromlist=["EntityMention"]).EntityMention("田中", "PERSON", 0, 2)],
-            "佐藤": [__import__("chunking.schema", fromlist=["EntityMention"]).EntityMention("佐藤", "PERSON", 0, 2)],
-            "スカラー商事": [__import__("chunking.schema", fromlist=["EntityMention"]).EntityMention("スカラー商事", "ORG", 0, 6)],
+            "田中": [EntityMention("田中", "PERSON", 0, 2)],
+            "佐藤": [EntityMention("佐藤", "PERSON", 0, 2)],
+            "スカラー商事": [EntityMention("スカラー商事", "ORG", 0, 6)],
         }
     )
     from chunking.llm import GenerateResult
@@ -124,20 +125,39 @@ def test_literal_query_finds_relevant_chunk(tmp_path: Path) -> None:
 
 
 def test_paraphrase_query_recorded(tmp_path: Path) -> None:
+    """F-018: 実アサーション付きの検索品質テスト.
+
+    言い換えクエリ「経営統合の経緯」に対して、stub tokenizer は語彙を
+    ヒットさせられないのでここでは stub 辞書の語を含む「スカラー商事 プロジェクト」で
+    代用し、少なくとも 1 件の関連チャンクが top-K に入ることを検証する.
+    実サンプルで Ginza を使った場合の言い換えクエリ品質検証は
+    ``test_real_samples_end_to_end_query`` が担当 (samples/expected.yaml 経由).
+    """
     out = _ingest_fixture(tmp_path, skip_wiki=True)
     result = run_query_impl(
-        out, "経営統合の経緯", top_k=10,
+        out, "スカラー商事 プロジェクト", top_k=10,
         analyzer_factory=lambda path: _StubAnalyzer(),
     )
-    report = {
-        "query": "経営統合の経緯",
-        "hits_count": len(result.hits),
-        "top_chunk_texts": [h.text[:60] for h in result.hits[:3]],
-        "exit_code": result.exit_code,
-    }
+    assert result.exit_code == 0, result.error_message
+    assert result.hits, "no hits returned for keyword query"
+    # 上位 K に「スカラー商事」や「プロジェクト」を含むチャンクが少なくとも 1 件入っている
+    combined = " ".join(h.text for h in result.hits)
+    assert "スカラー商事" in combined or "プロジェクト" in combined
+    # 記録も残す (デバッグ用)
     report_path = tmp_path / "paraphrase_report.json"
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), "utf-8")
-    assert report_path.exists()  # 記録のみ、常にパス
+    report_path.write_text(
+        json.dumps(
+            {
+                "query": "スカラー商事 プロジェクト",
+                "hits_count": len(result.hits),
+                "top_chunk_texts": [h.text[:60] for h in result.hits[:3]],
+                "exit_code": result.exit_code,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        "utf-8",
+    )
 
 
 def test_readme_has_paraphrase_limitation_section() -> None:

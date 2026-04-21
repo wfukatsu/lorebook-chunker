@@ -123,7 +123,12 @@ def test_aggregate_empty_inputs() -> None:
 
 
 def test_sanitize_entity_filename_basic() -> None:
-    assert sanitize_entity_filename("PERSON", "田中太郎") == "PERSON__田中太郎.md"
+    # F-012 で短い sha256 prefix が suffix として常時付与される
+    result = sanitize_entity_filename("PERSON", "田中太郎")
+    assert result.startswith("PERSON__田中太郎_")
+    assert result.endswith(".md")
+    # 決定論的
+    assert sanitize_entity_filename("PERSON", "田中太郎") == result
 
 
 def test_sanitize_entity_filename_handles_unsafe_chars() -> None:
@@ -134,9 +139,18 @@ def test_sanitize_entity_filename_handles_unsafe_chars() -> None:
     assert result.startswith("ORG__")
 
 
+def test_sanitize_entity_filename_disambiguates_slash_vs_backslash() -> None:
+    """F-012: `A/B` と `A\\B` は sanitize 後同じ文字列になるが、sha256 suffix で区別される."""
+    slash = sanitize_entity_filename("ORG", "A/B")
+    backslash = sanitize_entity_filename("ORG", "A\\B")
+    assert slash != backslash
+
+
 def test_sanitize_entity_filename_windows_reserved() -> None:
-    assert sanitize_entity_filename("PERSON", "CON") == "PERSON__CON_.md"
-    assert sanitize_entity_filename("PERSON", "nul") == "PERSON__nul_.md"  # case-insensitive
+    result = sanitize_entity_filename("PERSON", "CON")
+    assert result.startswith("PERSON__CON__")  # `_` (Windows suffix) + `_` (prefix sep)
+    result_lower = sanitize_entity_filename("PERSON", "nul")
+    assert result_lower.startswith("PERSON__nul__")
 
 
 def test_sanitize_entity_filename_long_name_gets_hash() -> None:
@@ -150,7 +164,21 @@ def test_sanitize_entity_filename_long_name_gets_hash() -> None:
 
 
 def test_sanitize_entity_filename_whitespace_replaced() -> None:
-    assert sanitize_entity_filename("ORG", "A B C") == "ORG__A_B_C.md"
+    result = sanitize_entity_filename("ORG", "A B C")
+    assert result.startswith("ORG__A_B_C_")
+    assert result.endswith(".md")
+
+
+def test_sanitize_entity_filename_rejects_dot_only_names() -> None:
+    """F-024: ドットのみ/空の entity_name は ValueError を上げる."""
+    # "..." → sanitize 後も "...", + `_disambig` suffix で dot-only ではなくなるが、
+    # entity_name が空や dot-only の場合、stem が "_{hash}" で問題ないケースもある.
+    # 先頭ドットはあり得る: 元 name が "." のとき safe_name=".", stem=".{_}{hash}" → starts_with(".")
+    import pytest as _pt
+    with _pt.raises(ValueError):
+        sanitize_entity_filename("ORG", ".")
+    with _pt.raises(ValueError):
+        sanitize_entity_filename("ORG", "..")
 
 
 def test_target_labels_default_matches_plan() -> None:

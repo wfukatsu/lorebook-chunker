@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Iterator
 
 from chunking.schema import ChunkRecord
@@ -79,11 +79,13 @@ class Chunker:
         base_chunks = list(self._accumulate_chunks(sentence_spans, normalized_text))
         final_chunks = self._apply_overlap(base_chunks, sentence_spans, normalized_text)
         posix_source = self._posix_relative(source_relative_path, input_dir)
-        for idx, (start, end, text) in enumerate(final_chunks):
+        for (start, end, text) in final_chunks:
             cid = self._compute_chunk_id(posix_source, start, end, text)
+            # row_index は ingest 時にコーパス全体でグローバルに振り直す
+            # (ここでは sentinel -1 を埋めておく)
             yield ChunkRecord(
                 chunk_id=cid,
-                row_index=idx,
+                row_index=-1,
                 source=posix_source,
                 char_start=start,
                 char_end=end,
@@ -263,10 +265,12 @@ class Chunker:
     def _posix_relative(source: str, input_dir: str | None) -> str:
         if input_dir is None:
             return source
+        # Windows のバックスラッシュパスにも対応するため native Path を使い、
+        # 最後に .as_posix() で forward slash に統一する。
         try:
-            return str(PurePosixPath(source).relative_to(PurePosixPath(input_dir)))
+            return Path(source).relative_to(Path(input_dir)).as_posix()
         except ValueError:
-            return str(PurePosixPath(source))
+            return Path(source).as_posix()
 
     @staticmethod
     def _compute_chunk_id(posix_source: str, start: int, end: int, text: str) -> str:

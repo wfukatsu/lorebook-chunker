@@ -14,6 +14,8 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+from chunking.schema import KeywordEntry
+
 # analyzer callable 契約: str -> list[str]
 AnalyzerCallable = Callable[[str], list[str]]
 
@@ -73,23 +75,40 @@ class TfidfBuilder:
 
     def top_keywords_per_chunk(
         self, matrix: csr_matrix, vocabulary: dict[str, int]
-    ) -> list[list[dict[str, Any]]]:
-        """各行の TF-IDF 上位 N 語を返す."""
-        inv_vocab = {idx: term for term, idx in vocabulary.items()}
-        rows: list[list[dict[str, Any]]] = []
+    ) -> list[list[KeywordEntry]]:
+        """各行の TF-IDF 上位 N 語を返す.
+
+        F-039: CSR の data/indices/indptr を直接走査し、`argpartition` で上位 K を抽出.
+        """
+        # idx -> term の配列を 1 度だけ構築 (O(V)).
+        inv_vocab_arr: list[str] = [""] * len(vocabulary)
+        for term, idx in vocabulary.items():
+            inv_vocab_arr[idx] = term
+
+        data = matrix.data
+        indices = matrix.indices
+        indptr = matrix.indptr
+        rows: list[list[KeywordEntry]] = []
+        top_k = self.top_keywords
         for row_idx in range(matrix.shape[0]):
-            row = matrix.getrow(row_idx)
-            if row.nnz == 0:
+            start = indptr[row_idx]
+            end = indptr[row_idx + 1]
+            row_data = data[start:end]
+            row_indices = indices[start:end]
+            if row_data.size == 0:
                 rows.append([])
                 continue
-            # getrow は sparse。data と indices を取って降順ソート
-            values = np.asarray(row.data)
-            indices = np.asarray(row.indices)
-            order = np.argsort(-values)[: self.top_keywords]
+            k = min(top_k, row_data.size)
+            # argpartition + argsort で top-k を降順に取り出す.
+            partitioned = np.argpartition(-row_data, k - 1)[:k]
+            ordered = partitioned[np.argsort(-row_data[partitioned])]
             rows.append(
                 [
-                    {"term": inv_vocab[int(indices[i])], "tfidf": float(values[i])}
-                    for i in order
+                    {
+                        "term": inv_vocab_arr[int(row_indices[i])],
+                        "tfidf": float(row_data[i]),
+                    }
+                    for i in ordered
                 ]
             )
         return rows
@@ -103,7 +122,13 @@ class TfidfBuilder:
         vocabulary: dict[str, int],
         idf: np.ndarray,
     ) -> None:
-        """vocab.npz に matrix + vocabulary + idf + config を統合保存."""
+        """vocab.npz に matrix + vocabulary + idf + config を統合保存.
+
+        F-002 + F-026: `object` dtype は np.load(allow_pickle=True) を要求し、
+        悪意ある .npz が任意コード実行を許す経路になる. vocabulary_terms は
+        `np.str_` (=unicode) dtype、config は utf-8 エンコード済みバイト列で保存し、
+        load 側は `allow_pickle=False` で読めるようにする.
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         config = self._build_config()
@@ -111,7 +136,8 @@ class TfidfBuilder:
         terms_in_order = [""] * len(vocabulary)
         for term, idx in vocabulary.items():
             terms_in_order[idx] = term
-        vocab_array = np.array(terms_in_order, dtype=object)
+        vocab_array = np.array(terms_in_order, dtype=np.str_)
+        config_bytes = json.dumps(config, ensure_ascii=False).encode("utf-8")
         np.savez_compressed(
             path,
             matrix_data=matrix.data,
@@ -120,13 +146,13 @@ class TfidfBuilder:
             matrix_shape=np.asarray(matrix.shape, dtype=np.int64),
             vocabulary_terms=vocab_array,
             idf=idf,
-            config_json=np.array(json.dumps(config), dtype=object),
+            config_json=np.frombuffer(config_bytes, dtype=np.uint8),
         )
 
     @staticmethod
     def load(path: str | Path) -> TfidfArtifacts:
         path = Path(path)
-        with np.load(path, allow_pickle=True) as data:
+        with np.load(path, allow_pickle=False) as data:
             matrix = csr_matrix(
                 (
                     data["matrix_data"],
@@ -135,10 +161,12 @@ class TfidfBuilder:
                 ),
                 shape=tuple(data["matrix_shape"]),
             )
-            terms = list(data["vocabulary_terms"])
-            vocabulary = {str(term): idx for idx, term in enumerate(terms)}
+            terms_raw = data["vocabulary_terms"]
+            vocabulary = {str(term): idx for idx, term in enumerate(terms_raw)}
             idf = np.asarray(data["idf"], dtype=np.float64)
-            config = json.loads(str(data["config_json"]))
+            # config_json は uint8 配列で保存されているので bytes に戻して JSON decode.
+            config_bytes = bytes(np.asarray(data["config_json"], dtype=np.uint8).tobytes())
+            config = json.loads(config_bytes.decode("utf-8"))
         return TfidfArtifacts(
             matrix=matrix,
             vocabulary=vocabulary,

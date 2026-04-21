@@ -10,11 +10,13 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Callable, Iterable, NoReturn, Protocol
 
 from chunking.chunker import Chunker
+from chunking.cli import IDENTITY_BANNER
 from chunking.llm import LLMClient, LLMPermanentError, get_client
 from chunking.ner import (
+    AggregationStats,
     DEFAULT_MIN_CHUNKS,
     DEFAULT_MIN_MENTIONS,
     DEFAULT_TARGET_LABELS,
@@ -52,10 +54,6 @@ class IngestAnalyzer(Protocol):
     def tokenize_for_tfidf(self, text: str) -> list[str]: ...
 
     def save(self, path: str | os.PathLike[str]) -> None: ...
-
-
-AnalyzerFactory = Callable[[Path | None], IngestAnalyzer]
-LLMClientFactory = Callable[[str, dict[str, Any] | None], LLMClient]
 
 
 def default_analyzer_factory(existing_path: Path | None) -> IngestAnalyzer:
@@ -107,8 +105,8 @@ class IngestRunner:
         self,
         cfg: IngestConfig,
         *,
-        analyzer_factory: AnalyzerFactory = default_analyzer_factory,
-        llm_factory: LLMClientFactory = get_client,
+        analyzer_factory: "Callable[[Path | None], IngestAnalyzer]" = default_analyzer_factory,
+        llm_factory: "Callable[[str, dict[str, Any] | None], LLMClient]" = get_client,
     ) -> None:
         self.cfg = cfg
         self._analyzer_factory = analyzer_factory
@@ -192,12 +190,17 @@ class IngestRunner:
             for w in chunker.warnings:
                 result.warnings.append(f"chunker/{w.kind}: {w.detail}")
 
+            # F-001: row_index はコーパス全体に対してグローバルに振る.
+            # chunker 側では -1 sentinel が入っている.
+            for i, chunk in enumerate(all_chunks):
+                chunk.row_index = i
+
             if not all_chunks:
                 result.exit_code = 5
                 result.errors.append("chunking produced 0 chunks")
                 return result
 
-            # 4. TF-IDF
+            # 4. TF-IDF (この順序が all_chunks の row_index と一致する前提)
             tfidf = TfidfBuilder(
                 analyzer=analyzer.tokenize_for_tfidf,
                 top_keywords=self.cfg.top_keywords,
@@ -252,10 +255,12 @@ class IngestRunner:
                 except LLMPermanentError as e:
                     result.exit_code = 6
                     result.errors.append(f"wiki generation aborted: {e}")
+                    # F-015: systemic-abort 時は staging の manifest を sibling dir に退避.
+                    _preserve_failed_manifest(self.cfg.output_dir, staging)
                     return result
 
-            # 8. index.md
-            _write_index_md(staging / "index.md", staging / "entities" / "manifest.json")
+                # 8. index.md (--skip-wiki 時には作らない — F-009)
+                _write_index_md(staging / "index.md", staging / "entities" / "manifest.json")
 
             # 9. log.md
             _append_log_md(
@@ -279,9 +284,12 @@ class IngestRunner:
             logger.exception("ingest failed")
             result.exit_code = 10
             result.errors.append(f"ingest failure: {e}")
+            return result
+        finally:
+            # F-005/F-058: 早期 return (exit_code 5/6/10 等) 時にも staging をクリーンアップ.
+            # atomic swap が成功した場合は staging は既に rename 済みで存在しない.
             if staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)
-            return result
 
 
 # ---- helpers --------------------------------------------------------
@@ -293,14 +301,36 @@ def _collect_input_files(input_dir: Path) -> list[Path]:
     return sorted(input_dir.glob("*.txt"))
 
 
-def _ginza_model_version(analyzer: Any) -> str:
+def _ginza_model_version(analyzer: IngestAnalyzer) -> str:
+    """analyzer.build_config() から model_name@ginza_version を取り出す.
+
+    F-021: 失敗時は "unknown" を返すが、黙って返さず warning を出すことで
+    source_hash の無音破壊 (Ginza 更新が検知されない) を目視可能にする.
+    """
     try:
-        cfg = analyzer.build_config()
+        cfg = analyzer.build_config()  # type: ignore[attr-defined]
         name = cfg.strict_match.get("model_name", "unknown")
         ver = cfg.compat_match.get("ginza", "unknown")
         return f"{name}@{ver}"
-    except Exception:
+    except Exception as e:
+        logger.warning("ginza model version lookup failed: %s", e)
         return "unknown"
+
+
+def _preserve_failed_manifest(output_dir: Path, staging: Path) -> None:
+    """systemic-abort 時に staging の manifest を sibling dir へ退避 (F-015).
+
+    staging 自体は caller の finally で削除されるが、退避先は残す.
+    """
+    manifest = staging / "entities" / "manifest.json"
+    if not manifest.exists():
+        return
+    sibling = output_dir.with_name(output_dir.name + ".failed") / "entities"
+    try:
+        sibling.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(manifest, sibling / "manifest.json")
+    except OSError as e:  # pragma: no cover
+        logger.warning("failed to preserve manifest for inspection: %s", e)
 
 
 def _atomic_swap(target: Path, staging: Path) -> None:
@@ -367,7 +397,7 @@ def _append_log_md(
     input_files: list[Path],
     skipped_files: int,
     chunks_generated: int,
-    agg_stats,
+    agg_stats: AggregationStats,
     wiki_stats: WikiStats,
     warnings: list[str],
     ginza_model: str,
@@ -414,14 +444,30 @@ class _NoopLLM:
 
     model_id = "noop@skip-wiki"
 
-    def generate(self, prompt: str, max_tokens: int):  # pragma: no cover
+    def generate(self, prompt: str, max_tokens: int) -> NoReturn:  # pragma: no cover
         raise RuntimeError("NoopLLM.generate should not be called when skip_wiki=True")
 
 
 # ---- CLI entry ------------------------------------------------------
 
 
+INGEST_EXIT_CODES = """\
+exit codes:
+  0  success
+  2  no input .txt files under input_dir
+  3  LLM backend unavailable (permanent error at init)
+  4  analyzer init failed
+  5  chunking produced zero chunks
+  6  wiki generation aborted (systemic failure detected)
+  10 unexpected error (see log / stderr)
+"""
+
+
 def run_ingest(args: argparse.Namespace) -> int:
+    quiet = getattr(args, "quiet", False)
+    if not quiet:
+        print(IDENTITY_BANNER, file=sys.stderr)
+
     cfg = IngestConfig(
         input_dir=Path(args.input_dir),
         output_dir=Path(args.output_dir),
@@ -449,10 +495,34 @@ def run_ingest(args: argparse.Namespace) -> int:
         print(f"[warn] {w}", file=sys.stderr)
     for e in result.errors:
         print(f"[error] {e}", file=sys.stderr)
+
+    # F-036: success time に ingest_result.json を書き出し. JSON format 時は stdout にも出力.
+    summary = {
+        "exit_code": result.exit_code,
+        "chunks_generated": result.chunks_generated,
+        "total_input_files": result.total_input_files,
+        "skipped_files": result.skipped_files,
+        "warnings": list(result.warnings),
+        "errors": list(result.errors),
+        "output_dir": str(cfg.output_dir),
+    }
+    fmt = getattr(args, "format", "human")
     if result.exit_code == 0:
-        print(
-            f"ingest OK: {result.chunks_generated} chunks from "
-            f"{result.total_input_files - result.skipped_files} files -> {cfg.output_dir}",
-            file=sys.stderr,
-        )
+        try:
+            (cfg.output_dir / "ingest_result.json").write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError as e:  # pragma: no cover
+            logger.warning("failed to write ingest_result.json: %s", e)
+        if fmt == "json":
+            print(json.dumps(summary, ensure_ascii=False))
+        elif not quiet:
+            print(
+                f"ingest OK: {result.chunks_generated} chunks from "
+                f"{result.total_input_files - result.skipped_files} files -> {cfg.output_dir}",
+                file=sys.stderr,
+            )
+    else:
+        if fmt == "json":
+            print(json.dumps(summary, ensure_ascii=False))
     return result.exit_code

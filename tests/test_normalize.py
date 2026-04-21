@@ -15,7 +15,8 @@ def test_crlf_and_cr_to_lf() -> None:
 
 
 def test_trailing_whitespace_per_line() -> None:
-    assert normalize_text("abc   \ndef\t\n") == "abc\ndef\n"
+    # 末尾の空白 (trailing `\n` を含む) は strip 段階で除去される
+    assert normalize_text("abc   \ndef\t\n") == "abc\ndef"
 
 
 def test_collapse_consecutive_spaces() -> None:
@@ -59,10 +60,11 @@ def test_normalization_spec_exported() -> None:
         "lf_only": True,
         "strip_trailing": True,
         "collapse_spaces": True,
+        "trim": True,
     }
 
 
 def test_mixed_real_world() -> None:
     s = "  Ｈｅｌｌｏ　　世界  \r\n\tテスト　です  \r\n"
-    expected = " Hello 世界\n テスト です\n"
+    expected = "Hello 世界\n テスト です"
     assert normalize_text(s) == expected

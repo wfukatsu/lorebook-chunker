@@ -2,18 +2,20 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import difflib
 import json
 import logging
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
-import yaml
 from scipy.sparse import csr_matrix
 
+from chunking._io import load_chunks
+from chunking.schema import ChunkFileCorruptError
 from chunking.tfidf import TfidfBuilder
 
 logger = logging.getLogger(__name__)
@@ -27,6 +29,11 @@ DEFAULT_DUPLICATE_COSINE = 0.95
 DEFAULT_DEGENERATE_L2 = 1e-6
 DEFAULT_DEGENERATE_NNZ = 3
 DEFAULT_LEVENSHTEIN_RATIO = 0.85
+
+# lint の exit code (F-008)
+EXIT_OK = 0
+EXIT_WARNING = 1
+EXIT_FATAL = 2
 
 
 @dataclass
@@ -98,7 +105,11 @@ def run_lint_impl(
         return report
 
     # chunks.jsonl
-    chunks = list(_load_chunks(chunks_path))
+    try:
+        chunks = list(load_chunks(chunks_path))
+    except ChunkFileCorruptError as e:
+        report.add(FATAL, "schema", "chunks.jsonl の行が JSON として壊れています", detail=str(e))
+        return report
     if not chunks:
         report.add(FATAL, "empty_corpus", "chunks.jsonl が空です")
         return report
@@ -205,14 +216,6 @@ def run_lint_impl(
 # ---- helpers ---------------------------------------------------
 
 
-def _load_chunks(path: Path) -> Iterable[dict[str, Any]]:
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
-
-
 def _looks_single_sentence(text: str) -> bool:
     """句点「。」が末尾以外に現れなければ 1 文扱い."""
     count = text.count("。")
@@ -225,16 +228,12 @@ def _detect_degenerate_rows(
     l2_threshold: float,
     nnz_threshold: int,
 ) -> list[int]:
-    out: list[int] = []
-    for i in range(matrix.shape[0]):
-        row = matrix.getrow(i)
-        if row.nnz < nnz_threshold:
-            out.append(i)
-            continue
-        norm = float(np.sqrt(row.multiply(row).sum()))
-        if norm < l2_threshold:
-            out.append(i)
-    return out
+    """F-061: CSR の indptr / power().sum() で全行をベクトル化処理."""
+    nnz_per_row = np.diff(matrix.indptr)
+    l2_sq = np.asarray(matrix.power(2).sum(axis=1)).ravel()
+    l2 = np.sqrt(l2_sq)
+    mask = (nnz_per_row < nnz_threshold) | (l2 < l2_threshold)
+    return np.where(mask)[0].tolist()
 
 
 def _detect_duplicates(
@@ -287,10 +286,35 @@ def _detect_similar_names(
 
 def run_lint(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir)
-    report = run_lint_impl(output_dir)
-    _print_human_report(report, output_dir)
+    report = run_lint_impl(
+        output_dir,
+        pairwise_threshold=getattr(args, "pairwise_threshold", DEFAULT_LINT_PAIRWISE_THRESHOLD),
+        duplicate_cosine=getattr(args, "duplicate_cosine", DEFAULT_DUPLICATE_COSINE),
+        degenerate_l2=getattr(args, "degenerate_l2", DEFAULT_DEGENERATE_L2),
+        degenerate_nnz=getattr(args, "degenerate_nnz", DEFAULT_DEGENERATE_NNZ),
+        levenshtein_ratio=getattr(args, "levenshtein_ratio", DEFAULT_LEVENSHTEIN_RATIO),
+        target_chunk_chars=getattr(args, "target_chunk_chars", 500),
+        max_chunk_chars=getattr(args, "max_chunk_chars", 1500),
+    )
+    fmt = getattr(args, "format", "human")
+    if fmt == "json":
+        _print_json_report(report)
+        # sidecar も書き出し
+        try:
+            _write_lint_json(output_dir / "lint.json", report)
+        except OSError:  # pragma: no cover
+            pass
+    else:
+        _print_human_report(report, output_dir)
+    # lint.md は常に書く
     _write_lint_md(output_dir / "lint.md", report)
-    return 0 if report.count(FATAL) == 0 else 1
+
+    # F-008: exit code は 致命/警告/OK で 0/1/2 の 3 段階
+    if report.count(FATAL) > 0:
+        return EXIT_FATAL
+    if report.count(WARNING) > 0:
+        return EXIT_WARNING
+    return EXIT_OK
 
 
 def _print_human_report(report: LintReport, output_dir: Path) -> None:
@@ -302,6 +326,31 @@ def _print_human_report(report: LintReport, output_dir: Path) -> None:
         print(f"[{f.severity}] {f.category}: {f.message}", file=sys.stderr)
         if f.detail:
             print(f"    {f.detail}", file=sys.stderr)
+
+
+def _print_json_report(report: LintReport) -> None:
+    payload = {
+        "summary": {
+            "fatal": report.count(FATAL),
+            "warning": report.count(WARNING),
+            "info": report.count(INFO),
+        },
+        "findings": [dataclasses.asdict(f) for f in report.findings],
+    }
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+def _write_lint_json(path: Path, report: LintReport) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "summary": {
+            "fatal": report.count(FATAL),
+            "warning": report.count(WARNING),
+            "info": report.count(INFO),
+        },
+        "findings": [dataclasses.asdict(f) for f in report.findings],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _write_lint_md(path: Path, report: LintReport) -> None:

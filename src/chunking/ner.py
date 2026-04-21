@@ -8,8 +8,8 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Any, Iterable, Protocol, Sequence
+from dataclasses import dataclass, field
+from typing import Iterable, Protocol, Sequence
 
 from chunking.schema import ChunkRecord, EntityAggregate, EntityMention
 
@@ -77,6 +77,15 @@ def attach_entities_to_chunks(
         ]
 
 
+@dataclass
+class _EntityAccum:
+    """aggregate_entities の per-(name,label) 蓄積用 (F-051)."""
+
+    mentions: int = 0
+    chunk_ids: set[str] = field(default_factory=set)
+    cooccurring: set[tuple[str, str]] = field(default_factory=set)
+
+
 def aggregate_entities(
     chunks: Sequence[ChunkRecord],
     entities_per_chunk: Sequence[Sequence[EntityMention]],
@@ -88,40 +97,38 @@ def aggregate_entities(
     if len(chunks) != len(entities_per_chunk):
         raise ValueError("chunks and entities_per_chunk must have same length")
 
-    per_key: dict[tuple[str, str], dict[str, Any]] = defaultdict(
-        lambda: {"mentions": 0, "chunk_ids": set(), "cooccurring": set()}
-    )
+    per_key: dict[tuple[str, str], _EntityAccum] = defaultdict(_EntityAccum)
     for chunk, mentions in zip(chunks, entities_per_chunk):
         chunk_co: set[tuple[str, str]] = {(m.name, m.ner_label) for m in mentions}
         for mention in mentions:
             key = (mention.name, mention.ner_label)
-            per_key[key]["mentions"] += 1
-            per_key[key]["chunk_ids"].add(chunk.chunk_id)
-            per_key[key]["cooccurring"].update(chunk_co - {key})
+            acc = per_key[key]
+            acc.mentions += 1
+            acc.chunk_ids.add(chunk.chunk_id)
+            acc.cooccurring.update(chunk_co - {key})
+
+    # F-041: チャンク出現順を 1 度だけ辞書化して、各 entity で O(1) lookup に使う.
+    chunk_positions = {chunk.chunk_id: i for i, chunk in enumerate(chunks)}
 
     total = len(per_key)
     accepted: list[EntityAggregate] = []
     skipped = 0
-    for (name, label), d in per_key.items():
-        mentions = int(d["mentions"])
-        chunk_ids_set: set[str] = d["chunk_ids"]  # type: ignore[assignment]
-        if mentions < min_mentions or len(chunk_ids_set) < min_chunks:
+    for (name, label), acc in per_key.items():
+        if acc.mentions < min_mentions or len(acc.chunk_ids) < min_chunks:
             skipped += 1
             continue
         cooccurring = sorted(
-            ({"name": n, "ner_label": l} for (n, l) in d["cooccurring"]),  # type: ignore[union-attr]
+            ({"name": n, "ner_label": l} for (n, l) in acc.cooccurring),
             key=lambda obj: (obj["ner_label"], obj["name"]),
         )
-        # chunk_ids はチャンクの出現順を保つよう、順序付きで抽出
-        ordered_chunk_ids = [
-            c.chunk_id for c in chunks if c.chunk_id in chunk_ids_set
-        ]
+        # F-041: O(E·C) から O(C log C) へ: chunk_positions で index 比較.
+        ordered_chunk_ids = sorted(acc.chunk_ids, key=chunk_positions.__getitem__)
         accepted.append(
             EntityAggregate(
                 name=name,
                 ner_label=label,
-                mention_count=mentions,
-                chunk_count=len(chunk_ids_set),
+                mention_count=acc.mentions,
+                chunk_count=len(acc.chunk_ids),
                 chunk_ids=ordered_chunk_ids,
                 cooccurring_entities=cooccurring,
             )
@@ -137,19 +144,42 @@ def aggregate_entities(
 
 # ---- filename sanitization -----------------------------------------------
 
+_DOT_ONLY_RE = re.compile(r"^\.+$")
+
+
 def sanitize_entity_filename(ner_label: str, entity_name: str) -> str:
     """`{label}__{sanitized}.md` 形式で衝突安全なファイル名を生成.
 
     - 不正文字 `/ \\ : * ? " < > |` と任意の空白を `_` に置換
     - Windows 予約名 (CON, NUL, COM1, ...) は末尾に `_` を付与
     - UTF-8 バイト長が 128 を超えたら切り詰めて末尾に short hash を付与
+    - F-012: `A/B` と `A\\B` が同じ sanitized 形になる衝突を避けるため、
+      元の entity_name から導出した短い sha256 prefix を常に suffix に付与する.
+    - F-024: 空 / `...` / 先頭ドットなど危険な basename を reject (ValueError).
     """
     # label は英字のみ前提 (OntoNotes5) だが、念のため sanitize
     safe_label = _UNSAFE_FILENAME_RE.sub("_", ner_label)
     safe_name = _UNSAFE_FILENAME_RE.sub("_", entity_name)
     if safe_name.upper() in _WINDOWS_RESERVED:
         safe_name = safe_name + "_"
-    base = f"{safe_label}__{safe_name}"
+    # F-012: 元 entity_name の sha256 6-byte prefix を常に付与し、非可逆サニタイズの
+    # 衝突を一意化する. label は独立スコープなので label 内ではこれで衝突ゼロ.
+    disambiguator = hashlib.sha256(
+        f"{ner_label}\x00{entity_name}".encode("utf-8")
+    ).hexdigest()[:6]
+    base = f"{safe_label}__{safe_name}_{disambiguator}"
+
+    # F-024: 安全性チェック
+    stem_after_label = safe_name + "_" + disambiguator
+    if (
+        not stem_after_label
+        or _DOT_ONLY_RE.match(stem_after_label)
+        or stem_after_label.startswith(".")
+    ):
+        raise ValueError(
+            f"invalid entity filename stem derived from {entity_name!r}"
+        )
+
     encoded = base.encode("utf-8")
     if len(encoded) > _FILENAME_MAX_BYTES:
         # 128 - 8 (hash) - 1 (_) = 119 bytes ぶんを prefix として使う

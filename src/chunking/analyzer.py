@@ -11,6 +11,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -215,11 +216,23 @@ class JapaneseAnalyzer:
         )
 
     def save(self, path: str | os.PathLike[str]) -> None:
+        """analyzer.json を atomic write (F-057): tempfile + fsync + os.replace."""
         config = self.build_config()
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(config.to_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".analyzer.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(config.to_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
 
     @classmethod
     def load_and_verify(cls, path: str | os.PathLike[str]) -> "JapaneseAnalyzer":

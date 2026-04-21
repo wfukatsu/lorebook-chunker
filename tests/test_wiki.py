@@ -173,11 +173,12 @@ def test_generate_all_happy_path(
     assert stats.succeeded == 2
     assert stats.failed == 0
     assert llm.call_count == 3  # pre-flight + 2 entities
-    # ファイル生成
-    person_file = cfg.entities_dir / "PERSON__田中太郎.md"
-    org_file = cfg.entities_dir / "ORG__スカラー商事.md"
-    assert person_file.exists()
-    assert org_file.exists()
+    # ファイル生成 (F-012: 末尾に sha256 短 hash が付くので prefix 一致で拾う)
+    person_files = list(cfg.entities_dir.glob("PERSON__田中太郎_*.md"))
+    org_files = list(cfg.entities_dir.glob("ORG__スカラー商事_*.md"))
+    assert len(person_files) == 1
+    assert len(org_files) == 1
+    person_file = person_files[0]
     # frontmatter は YAML として parse 可能
     text = person_file.read_text("utf-8")
     assert text.startswith("---\n")
@@ -187,8 +188,35 @@ def test_generate_all_happy_path(
     assert fm["ner_label"] == "PERSON"
     assert fm["ai_verification_status"] == "unverified"
     assert fm["prompt_template_version"] == PROMPT_TEMPLATE_VERSION
+    # F-006: plan R15 が要求する 3 フィールド
+    assert fm["status"] == "success"
+    assert fm["last_attempt_at"]
+    assert isinstance(fm["chunk_ids"], list)
+    assert fm["chunk_ids"] == ["c00", "c01", "c02"]
     # manifest.json
     assert cfg.manifest_path.exists()
+
+
+def test_llm_body_with_bare_triple_dash_keeps_single_frontmatter(
+    tmp_path: Path, chunks: list[ChunkRecord]
+) -> None:
+    """F-013: LLM 応答に裸の ``---`` が含まれても frontmatter は 1 ブロックのまま."""
+    entities = [_agg("田中", "PERSON", ["c00", "c01"], mentions=3)]
+    body = "要約の冒頭。\n---\n別ブロックに見えるテキスト。\n"
+    gen, _, cfg = _build(
+        tmp_path, chunks,
+        script=[_success("pre-flight"), _success(body)],
+    )
+    gen.generate_all(entities)
+    matches = list(cfg.entities_dir.glob("PERSON__田中_*.md"))
+    assert len(matches) == 1
+    page = matches[0].read_text("utf-8")
+    # frontmatter は先頭の ``---`` と、それに対応する閉じ ``---`` の 2 本のみ.
+    # 本文側の ``---`` は ``\---`` にエスケープされるので生の ``---`` は 2 回しか現れない.
+    bare = [ln for ln in page.splitlines() if ln == "---"]
+    assert len(bare) == 2
+    # エスケープ記号が含まれている
+    assert "\\---" in page
 
 
 def test_skip_wiki_config_bypasses_llm(
@@ -345,15 +373,17 @@ def test_max_llm_calls_budget_skips_remaining(
     entities = [
         _agg(f"ent{i}", "PERSON", [f"c0{i}"], mentions=3 + i) for i in range(4)
     ]
-    # budget = 3 → pre-flight (1) + 最初 2 エンティティ = 3、残り 2 は budget_skipped
+    # F-003 修正後: budget はエンティティ試行数のみでカウント (pre-flight は別計上).
+    # budget = 3 → 最初 3 エンティティが試行、残り 1 は budget_skipped
     gen, _, _ = _build(
         tmp_path, chunks,
-        script=[_success("pre-flight"), _success("s1"), _success("s2")],
+        script=[_success("pre-flight"), _success("s1"), _success("s2"), _success("s3")],
         max_llm_calls=3,
     )
     stats = gen.generate_all(entities)
-    assert stats.succeeded == 2
-    assert stats.budget_skipped == 2
+    assert stats.succeeded == 3
+    assert stats.budget_skipped == 1
+    assert stats.preflight_calls == 1
 
 
 # ---- pre-flight ------------------------------------------------------

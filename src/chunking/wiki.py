@@ -15,10 +15,11 @@ import os
 import random
 import tempfile
 import time
+import re
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Literal, Sequence
 
 import yaml
 
@@ -56,7 +57,15 @@ SYSTEMIC_FAILURE_MIN_ATTEMPTS = 5
 SYSTEMIC_FAILURE_RATIO = 0.5
 MANIFEST_CHECKPOINT_INTERVAL = 5
 
-EntityStatus = str  # "success" | "failed" | "budget_skipped"
+EntityStatus = Literal["success", "failed", "budget_skipped"]
+
+# LLM 出力の中に裸の `---` があるとフロントマター区切りを割る (F-013)。
+_YAML_FRONTMATTER_FENCE = re.compile(r"^---$", re.MULTILINE)
+
+
+def _fence_yaml_markers(body: str) -> str:
+    """LLM 応答内の ``^---$`` を ``\\---`` にエスケープして YAML frontmatter を守る."""
+    return _YAML_FRONTMATTER_FENCE.sub(r"\\---", body)
 
 
 # ---- source_hash --------------------------------------------------------
@@ -145,6 +154,7 @@ class WikiStats:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     preflight_called: bool = False
+    preflight_calls: int = 0  # pre-flight が実 LLM 呼び出しを消費した回数
     systemic_failure_aborted: bool = False
     llm_model_id: str = ""
 
@@ -261,6 +271,10 @@ def _render_wiki_page(
         "prompt_template_version": PROMPT_TEMPLATE_VERSION,
         "ai_verification_status": ai_verification_status,
         "cooccurring_entities": entry.cooccurring_entities,
+        # F-006: plan R15 で必須の 3 フィールド (manifest のコピー)
+        "status": entry.status,
+        "last_attempt_at": entry.last_attempt_at,
+        "chunk_ids": list(entry.chunk_ids),
     }
     fm_text = yaml.safe_dump(
         frontmatter,
@@ -277,7 +291,8 @@ def _render_wiki_page(
     lines.append(f"# {entry.entity_name} ({entry.ner_label})")
     lines.append("")
     lines.append(SUMMARY_BODY_MARKER_BEGIN)
-    lines.append(summary_body.strip())
+    # F-013: 裸の `---` 行は YAML frontmatter を壊すのでエスケープする.
+    lines.append(_fence_yaml_markers(summary_body.strip()))
     lines.append(SUMMARY_BODY_MARKER_END)
     lines.append("")
     lines.append("## 出現チャンク")
@@ -292,12 +307,11 @@ def _render_wiki_page(
 
 
 def _build_chunk_snippets(
-    chunks: Sequence[ChunkRecord], chunk_ids: Iterable[str], span: int = 40
+    chunks_by_id: dict[str, ChunkRecord], chunk_ids: Iterable[str], span: int = 40
 ) -> list[dict[str, Any]]:
     snippets: list[dict[str, Any]] = []
-    by_id = {c.chunk_id: c for c in chunks}
     for cid in chunk_ids:
-        chunk = by_id.get(cid)
+        chunk = chunks_by_id.get(cid)
         if chunk is None:
             continue
         # 先頭の一部だけを excerpt として付ける (エンティティ位置を使うバリエーションは後続で)
@@ -346,6 +360,8 @@ class WikiGenerator:
         self._analyzer_json_hash = analyzer_json_hash
         self._ginza_model_version = ginza_model_version
         self._chunks = list(chunks)
+        # F-042: 全メソッドで共有する chunk_id -> ChunkRecord index.
+        self._chunks_by_id = {c.chunk_id: c for c in self._chunks}
         self._manifest = ManifestStore(config.manifest_path)
         self._sleep = sleep
         self._rng = rng or random.Random(42)
@@ -371,6 +387,7 @@ class WikiGenerator:
         # pre-flight (config で実呼び出しなら skip するオプションもあり得るが v1 は常時実行)
         self._preflight()
         stats.preflight_called = True
+        stats.preflight_calls += 1
 
         # 優先順序
         ordered = sorted(
@@ -381,8 +398,10 @@ class WikiGenerator:
         # ループ
         attempts_completed = 0
         for i, agg in enumerate(ordered, start=1):
-            # budget check (pre-flight は 1 回分使っている)
-            budget_consumed = stats.preflight_called + stats.attempted
+            # F-003: budget はエンティティ試行数のみでカウント.
+            # pre-flight は別カウンタ (stats.preflight_calls) で記録し、
+            # --max-llm-calls の budget からは外す.
+            budget_consumed = stats.attempted
             if self._config.max_llm_calls is not None and budget_consumed >= self._config.max_llm_calls:
                 # budget_skipped として記録
                 self._record_budget_skip(agg)
@@ -527,10 +546,9 @@ class WikiGenerator:
         return base + jitter
 
     def _build_entity_prompt(self, agg: EntityAggregate) -> str:
-        by_id = {c.chunk_id: c for c in self._chunks}
         pieces: list[str] = []
         for cid in agg.chunk_ids:
-            chunk = by_id.get(cid)
+            chunk = self._chunks_by_id.get(cid)
             if chunk is None:
                 continue
             pieces.append(f"- [{chunk.source}] {chunk.text}")
@@ -566,7 +584,7 @@ class WikiGenerator:
         filename = sanitize_entity_filename(agg.ner_label, agg.name)
         out_path = self._config.entities_dir / filename
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        snippets = _build_chunk_snippets(self._chunks, agg.chunk_ids)
+        snippets = _build_chunk_snippets(self._chunks_by_id, agg.chunk_ids)
         page = _render_wiki_page(
             entry,
             summary_body=result.text,

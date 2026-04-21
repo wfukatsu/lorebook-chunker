@@ -14,12 +14,16 @@ authors = [{ name = "Scalar Labs" }]
 dependencies = [
     "spacy>=3.7,<4",
     "ginza>=5.2",
+    # F-023: reproducible build のため sha256 を pin したいが、オフラインのため未確定.
+    # ネットワーク利用時: curl -sL <url> | sha256sum で hex を取得し以下に付与する:
+    #   ja-ginza-electra @ https://.../ja_ginza_electra-5.2.0-py3-none-any.whl#sha256=<HASH>
+    # TODO: pin sha256 once a reproducible build hash is available
     "ja-ginza-electra @ https://github.com/megagonlabs/ginza/releases/download/v5.2.0/ja_ginza_electra-5.2.0-py3-none-any.whl",
     "sudachipy>=0.6",
     "sudachidict-core",
     "scikit-learn>=1.4",
     "scipy>=1.11",
-    "numpy",
+    "numpy>=1.26,<2",
     "anthropic>=0.34",
     "ollama>=0.3",
     "pyyaml>=6",

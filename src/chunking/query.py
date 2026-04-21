@@ -6,16 +6,30 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Protocol
+from typing import Any
 
 import numpy as np
 
+from chunking._io import load_chunks
 from chunking.normalize import normalize_text
+from chunking.schema import ChunkFileCorruptError
 from chunking.tfidf import TfidfBuilder
 
 
-class QueryAnalyzer(Protocol):
-    def tokenize_for_tfidf(self, text: str) -> list[str]: ...
+def positive_int(value: str) -> int:
+    """argparse 用 custom type: 正の整数のみ受け付ける.
+
+    F-062: ``--top-k 0`` や負の値は ``--top-k must be a positive integer`` で reject.
+    """
+    try:
+        parsed = int(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            f"--top-k must be a positive integer (got {value!r})"
+        ) from e
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("--top-k must be a positive integer")
+    return parsed
 
 
 @dataclass
@@ -76,7 +90,10 @@ def run_query_impl(
     except Exception as e:
         return QueryResult(exit_code=3, hits=[], error_message=f"vocab.npz 読み込み失敗: {e}")
 
-    chunks = list(_load_chunks(chunks_path))
+    try:
+        chunks = list(load_chunks(chunks_path))
+    except ChunkFileCorruptError as e:
+        return QueryResult(exit_code=3, hits=[], error_message=str(e))
     if not chunks:
         return QueryResult(exit_code=3, hits=[], error_message="chunks.jsonl が空です")
     if len(chunks) != arts.matrix.shape[0]:
@@ -99,17 +116,23 @@ def run_query_impl(
         analyzer.tokenize_for_tfidf, arts.vocabulary, arts.idf, arts.config
     )
     q_norm = normalize_text(query_text)
+    # F-038: クエリトークン 0 or 全 OOV は exit 4 (no-match).
+    q_tokens = analyzer.tokenize_for_tfidf(q_norm)
+    if not q_tokens:
+        return QueryResult(
+            exit_code=4,
+            hits=[],
+            error_message="クエリをトークン化した結果が空でした (全てストップワード?)",
+        )
     q_vec = builder.transform_query(vectorizer, q_norm)
     if q_vec.nnz == 0:
-        # 全語彙にヒットしない — 低スコア返却 (lint 相当の警告は stderr で別途)
         return QueryResult(
-            exit_code=0,
+            exit_code=4,
             hits=[],
             error_message="クエリが既存語彙にヒットしませんでした (top_keywords 候補外)",
         )
 
     # Cosine similarity (matrix はすでに L2-normalized by TfidfVectorizer.norm='l2' default)
-    # matrix @ q.T の値はコサイン類似度に一致する (TfidfVectorizer デフォルト)
     scores = (arts.matrix @ q_vec.T).toarray().flatten()
     k = min(top_k, len(scores))
     top_indices = np.argpartition(-scores, k - 1)[:k]
@@ -126,25 +149,42 @@ def run_query_impl(
         for idx in top_sorted
         if scores[idx] > 0
     ]
+    if not hits:
+        # F-038: スコア > 0 のヒットなし = 実質 OOV.
+        return QueryResult(
+            exit_code=4,
+            hits=[],
+            error_message="no hits above zero score",
+        )
     return QueryResult(exit_code=0, hits=hits)
-
-
-def _load_chunks(path: Path) -> Iterable[dict[str, Any]]:
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
 
 
 def run_query(args: argparse.Namespace) -> int:
     out = Path(args.output_dir)
     result = run_query_impl(out, args.query_text, top_k=int(args.top_k))
+    fmt = getattr(args, "format", None) or ("json" if not sys.stdout.isatty() else "human")
     if result.exit_code != 0:
         print(f"[error] {result.error_message}", file=sys.stderr)
+        if fmt == "json":
+            print(json.dumps({"error": result.error_message, "hits": []}, ensure_ascii=False))
         return result.exit_code
     if result.error_message:
         print(f"[warn] {result.error_message}", file=sys.stderr)
+    if fmt == "json":
+        # F-017: 機械可読出力. stdout に JSON、ヒューマンログは stderr.
+        payload = [
+            {
+                "rank": i + 1,
+                "chunk_id": h.chunk_id,
+                "score": h.score,
+                "source": h.source,
+                "text": h.text,
+                "top_keywords": h.top_keywords,
+            }
+            for i, h in enumerate(result.hits)
+        ]
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
     if not result.hits:
         print("(no matching chunks)", file=sys.stderr)
         return 0

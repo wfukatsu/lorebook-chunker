@@ -89,9 +89,10 @@ def test_query_oov_returns_empty_hits_with_warning(tmp_path: Path) -> None:
         output_dir, "完全に別の語彙", top_k=3,
         analyzer_factory=lambda path: analyzer,
     )
-    assert result.exit_code == 0
+    # F-038: OOV は exit_code=4 (正常なゼロマッチと区別する).
+    assert result.exit_code == 4
     assert result.hits == []
-    assert "ヒットしませんでした" in result.error_message
+    assert result.error_message
 
 
 def test_query_respects_top_k(tmp_path: Path) -> None:

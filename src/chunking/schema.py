@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, TypedDict
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,45 @@ class EntityMention:
     char_end: int
 
 
+class KeywordEntry(TypedDict):
+    """TF-IDF 上位キーワードの 1 件."""
+
+    term: str
+    tfidf: float
+
+
+class NormalizationDict(TypedDict):
+    """analyzer.json strict_match.normalization の内訳."""
+
+    nfkc: bool
+    lf_only: bool
+    strip_trailing: bool
+    collapse_spaces: bool
+
+
+class StrictMatchDict(TypedDict):
+    """analyzer.json strict_match: 保存時と load 時で byte-for-byte 一致が必要な 8 フィールド."""
+
+    model_name: str
+    model_checksum: str
+    split_mode: str
+    pos_allowlist: list[str]
+    stopwords: list[str]
+    lemma_rules: str
+    sudachidict_binary_sha256: str
+    normalization: NormalizationDict
+
+
+class CompatMatchDict(TypedDict):
+    """analyzer.json compat_match: major.minor 一致で足りる 5 フィールド."""
+
+    ginza: str
+    spacy: str
+    sudachipy: str
+    sudachidict_package: str
+    sudachidict_package_version: str
+
+
 @dataclass
 class ChunkRecord:
     """chunks.jsonl 1 行分."""
@@ -28,7 +67,7 @@ class ChunkRecord:
     char_start: int
     char_end: int
     text: str
-    top_keywords: list[dict[str, Any]] = field(default_factory=list)
+    top_keywords: list[KeywordEntry] = field(default_factory=list)
     entities: list[dict[str, Any]] = field(default_factory=list)
 
     def to_jsonable(self) -> dict[str, Any]:
@@ -83,3 +122,7 @@ class AnalyzerVersionMismatchError(RuntimeError):
 
 class AnalyzerNEUnavailableError(RuntimeError):
     """Ginza の `token._.ne` 拡張が populate されていない."""
+
+
+class ChunkFileCorruptError(RuntimeError):
+    """chunks.jsonl の行が JSON として壊れている."""

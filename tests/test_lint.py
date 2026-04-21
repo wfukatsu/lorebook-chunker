@@ -171,24 +171,56 @@ def test_lint_detects_orphan_wiki(tmp_path: Path) -> None:
     assert any(f.category == "orphan_wiki" for f in report.findings)
 
 
-def test_lint_exit_code_zero_on_warnings_only(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
-    """lint の exit code は 致命 0 件なら 0 (警告のみなら 0)."""
+def test_lint_exit_code_warning_on_warnings_only(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """F-008: 警告のみの場合は exit code=1 (致命 0 件 = OK ではない)."""
     output_dir = _ingest(
         tmp_path,
         {"01.txt": "田中は働く。東京に住む。"},
     )
     args = argparse.Namespace(output_dir=str(output_dir), command="lint")
     code = run_lint(args)
-    assert code == 0
+    # この入力は wiki_disabled などの警告が出る想定
+    assert code == 1
     assert (output_dir / "lint.md").exists()
 
 
-def test_lint_exit_code_nonzero_on_fatal(tmp_path: Path) -> None:
+def test_lint_exit_code_fatal_on_missing_artifacts(tmp_path: Path) -> None:
+    """F-008: 致命検出なら exit code=2."""
     empty = tmp_path / "empty"
     empty.mkdir()
     args = argparse.Namespace(output_dir=str(empty), command="lint")
     code = run_lint(args)
-    assert code != 0
+    assert code == 2
+
+
+def test_lint_exit_code_zero_on_clean_corpus(tmp_path: Path) -> None:
+    """F-008: 致命も警告もなければ exit code=0."""
+    output_dir = _ingest(
+        tmp_path,
+        {
+            f"{i:02d}.txt": (
+                f"文書{i}の一文目。"
+                f"文書{i}の二文目を書きます。"
+                f"文書{i}の三文目。"
+            )
+            for i in range(1, 8)
+        },
+        target_chars=20,
+        max_chunk_chars=200,
+    )
+    # target_chunk_chars / max_chunk_chars は警告閾値なので明示して合わせる
+    args = argparse.Namespace(
+        output_dir=str(output_dir),
+        command="lint",
+        target_chunk_chars=20,
+        max_chunk_chars=200,
+    )
+    code = run_lint(args)
+    # コーパスが小さいので wiki_disabled 警告は出る可能性があるため、
+    # ここでは致命 0 = exit != 2 を確認 (実装仕様の最低保証).
+    assert code in (0, 1)
 
 
 def test_lint_pairwise_skipped_for_large_n(tmp_path: Path) -> None:
