@@ -96,30 +96,64 @@ class JapaneseAnalyzer:
         self._pos_allowlist = tuple(pos_allowlist)
         self._stopwords = frozenset(stopwords)
         self._tfidf_config = tfidf_config or {"min_df": 1, "max_df": 0.95}
-        self._nlp = spacy.load(model_name)
+        # Ginza 5.2 の compound_splitter は split_mode を None 既定で登録するため
+        # spacy 3.8 の厳格な Config 検証に失敗する. 明示的に上書きして型エラーを回避.
+        self._nlp = spacy.load(
+            model_name,
+            config={"components": {"compound_splitter": {"split_mode": split_mode}}},
+        )
+        # ja_ginza_electra 5.2 では token._.ne が自動登録されないため、本プロジェクト側で
+        # doc.ents + ENE_ONTONOTES_MAPPING から BIO + OntoNotes5 ラベルを派生させた上で
+        # Token 拡張 "ne" を登録する (plan の BIO walk ロジックはそのまま使える).
+        self._register_ne_extension()
         self._verify_ne_extension()
+
+    @staticmethod
+    def _register_ne_extension() -> None:
+        from spacy.tokens import Token  # lazy import
+
+        if Token.has_extension("ne"):
+            return
+        try:
+            from ginza import ENE_ONTONOTES_MAPPING  # type: ignore[import-untyped]
+        except ImportError:  # pragma: no cover - ginza pinned in pyproject
+            ENE_ONTONOTES_MAPPING = {}
+
+        def _ne_getter(token: Any) -> str | None:
+            ene = token.ent_type_
+            iob = token.ent_iob_
+            if not ene or iob in ("", "O"):
+                return None
+            onto = ENE_ONTONOTES_MAPPING.get(ene, ene)
+            return f"{iob}-{onto}"
+
+        Token.set_extension("ne", getter=_ne_getter)
 
     # ---- NER availability check --------------------------------------
 
     def _verify_ne_extension(self) -> None:
-        """token._.ne が populate されていることを確認.
+        """token._.ne が利用可能で、かつ既知のエンティティで populate されることを確認.
 
-        空文書で OK、短い日本語テキストで Token を作って ne 属性をチェック。
+        既知エンティティ入り文を流して最低 1 件の B-* タグが得られなければ raise。
+        (extension が未登録のパイプライン / NER コンポーネント欠落を検出する意図)
         """
         try:
-            doc = self._nlp("確認用。")
+            doc = self._nlp("スカラー商事は東京で発表した。")
         except Exception as exc:  # pragma: no cover
             raise AnalyzerNEUnavailableError(
                 f"Ginza パイプラインが初期化できません: {exc}"
             ) from exc
-        for token in doc:
-            ne_val = getattr(token._, "ne", None)
-            if ne_val is not None:
-                return
-        raise AnalyzerNEUnavailableError(
-            f"token._.ne が populate されていません。Ginza モデル {self._model_name!r} の "
-            "NER コンポーネントが有効か確認してください。"
-        )
+        try:
+            tags = [getattr(t._, "ne", None) for t in doc]
+        except AttributeError as exc:
+            raise AnalyzerNEUnavailableError(
+                f"token._.ne 拡張が未登録: {exc}"
+            ) from exc
+        if not any(isinstance(t, str) and t.startswith("B-") for t in tags):
+            raise AnalyzerNEUnavailableError(
+                f"token._.ne が populate されていません。Ginza モデル {self._model_name!r} の "
+                "NER コンポーネントが有効か確認してください。"
+            )
 
     # ---- Pipeline operations -----------------------------------------
 
