@@ -1,0 +1,17 @@
+# サンプル執筆後に更新してください (chunk 数や top-5 に入るべき substring を記入).
+# これは Unit 12 のスモークテストが参照する fixture です。
+#
+# 実サンプルが揃うまでは fixture ベースのスモークテスト (tests/fixtures/samples/) のみが実行され、
+# 本ファイルを参照するテストは skip されます。
+#
+# 形式例:
+#   file_char_counts:
+#     01_news.txt: [4500, 5500]   # 目標 5000 ±10%
+#     ...
+#   queries:
+#     - query: "合併の背景"
+#       expect_in_top_k: 5
+#       expect_chunk_from: "01_news.txt"
+
+file_char_counts: {}
+queries: []
