@@ -77,6 +77,7 @@ class IngestConfig:
     force_regenerate: bool = False
     retry_failed: bool = False
     llm_backend: str = "anthropic"
+    llm_model: str | None = None
     target_chars: int = 500
     overlap_chars: int = 100
     max_chunk_chars: int = 1500
@@ -125,8 +126,11 @@ class IngestRunner:
 
         # 早期 fail-fast: LLM バックエンド生成 (OpenAI なら即例外)
         if not self.cfg.skip_wiki:
+            llm_config: dict[str, Any] = {}
+            if self.cfg.llm_model:
+                llm_config["model"] = self.cfg.llm_model
             try:
-                llm = self._llm_factory(self.cfg.llm_backend, {})
+                llm = self._llm_factory(self.cfg.llm_backend, llm_config)
             except LLMPermanentError as e:
                 result.exit_code = 3
                 result.errors.append(f"LLM backend unavailable: {e}")
@@ -476,6 +480,7 @@ def run_ingest(args: argparse.Namespace) -> int:
         force_regenerate=getattr(args, "force_regenerate", False),
         retry_failed=getattr(args, "retry_failed", False),
         llm_backend=getattr(args, "llm_backend", "anthropic"),
+        llm_model=getattr(args, "llm_model", None),
     )
     # `--force-regenerate` と `--retry-failed` の共存: force 優先、retry は警告
     if cfg.force_regenerate and cfg.retry_failed:

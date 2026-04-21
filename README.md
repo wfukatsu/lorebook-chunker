@@ -21,22 +21,43 @@
 
 ## インストール
 
+### 前提環境
+
+- **Python 3.11 または 3.12**. 3.13 以降は `ja-ginza-electra` 依存の `tokenizers<0.14` に prebuilt wheel が無く、Rust ソースビルドも失敗するため `pyproject.toml` で `<3.13` に固定しています。macOS では `brew install python@3.11` で導入できます。
+- macOS / Linux (M1/M2/Intel). Windows は ChunkRecord のパス正規化 (`Path(...).relative_to(...).as_posix()`) では対応していますが、e2e は未検証です。
+
+### 依存インストール
+
 ```bash
-pip install -e .[dev]
-python -m spacy validate  # ja_ginza_electra の導入確認
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -e '.[dev]'
+python -m spacy validate  # ja_ginza_electra の導入確認 (✔ が出れば OK)
 ```
 
-`ja_ginza_electra` は PyPI 未公開のため URL 依存で取得されます。インストールに失敗する場合は [Ginza リリースページ](https://github.com/megagonlabs/ginza/releases) で最新の wheel URL を確認してください。
+`ja_ginza_electra` は PyPI 未公開のため GitHub Releases の wheel を URL 依存 (sha256 ピン) で取得します。初回 `chunking ingest` 実行時に ELECTRA transformer 本体 (~400MB) が HuggingFace Hub から追加ダウンロードされます (オフラインなら `HF_HUB_OFFLINE=1` + 事前キャッシュが必要)。
 
-LLM バックエンドの準備:
-- **Anthropic** (既定): `export ANTHROPIC_API_KEY=...`
-- **Ollama** (オフライン): `ollama pull qwen2.5:7b-instruct` 等
+### LLM バックエンドの準備
+
+- **Anthropic** (既定): `export ANTHROPIC_API_KEY=...`。既定モデルは `claude-haiku-4-5`。
+- **Ollama** (ローカル / オフライン): Ollama 本体をインストールし、モデルを pull。
+  ```bash
+  brew install ollama        # macOS; or see https://ollama.com/download
+  ollama serve &             # 常駐デーモン (既に起動済みならスキップ)
+  ollama pull qwen3:8b       # ~5.2GB. qwen2.5:7b-instruct-q4_K_M でも可.
+  ```
+  `qwen3:*` 系は `think` チャネルに全トークンを消費するため、本 CLI は内部で `think=False` を渡して最終出力のみを取得します。
 
 ## 使い方 (最短経路)
 
 ```bash
-# 処理
+# 既定 (Anthropic, claude-haiku-4-5) で処理
 chunking ingest samples/ out/
+
+# Ollama ローカルモデルを明示指定
+chunking ingest samples/ out/ --llm-backend ollama --llm-model qwen3:8b
+
+# Anthropic で別モデルを使う
+chunking ingest samples/ out/ --llm-backend anthropic --llm-model claude-sonnet-4-5
 
 # 検索 (ベースライン)
 chunking query out/ "合併の背景" --top-k 5
@@ -44,6 +65,15 @@ chunking query out/ "合併の背景" --top-k 5
 # 健全性チェック
 chunking lint out/
 ```
+
+### `--llm-model` について
+
+| バックエンド | `--llm-model` 未指定時の既定 | 例 |
+|---|---|---|
+| `anthropic` | `claude-haiku-4-5` | `--llm-model claude-sonnet-4-5` |
+| `ollama`    | `qwen2.5:7b-instruct-q4_K_M` (Ollama 側で pull 済みが必要) | `--llm-model qwen3:8b` |
+
+`--llm-model` は `--llm-backend` で選んだバックエンドに透過的に渡されます。バックエンドごとに独立したフラグを分ける代わりに、「バックエンド × モデル名」の 1 ペアで指定できる設計です。
 
 ## 終了コード
 
@@ -83,6 +113,7 @@ chunking lint out/
 - **TF-IDF IDF 安定性**: 数十チャンク規模のコーパスでは IDF 統計が不安定になります (文献通り)。本番コーパス規模で運用してください。
 - **Ollama 日本語要約品質**: モデル依存。本番品質は Anthropic を推奨。
 - **単一プロセス前提**: `log.md` に同時書き込みする複数 ingest 実行はサポートしません。
+- **Ginza 5.2 × spacy 3.8 互換シム**: `ja-ginza-electra 5.2.0` 本体は spacy 3.5 前後を想定した古い設定で配布されています。`analyzer.py` 側で (a) `compound_splitter.split_mode` の Config 上書きと、(b) `token._.ne` 拡張属性を `ginza.ENE_ONTONOTES_MAPPING` から派生する `spacy.tokens.Token.set_extension` 登録、を実行時に行うことで spacy 3.7〜3.8 でも動作します。Ginza 本体が更新された場合は shim 削除を検討してください。
 
 ## ライセンス
 

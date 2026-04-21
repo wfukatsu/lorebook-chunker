@@ -294,6 +294,7 @@ def test_run_ingest_cli_wrapper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
         force_regenerate=False,
         retry_failed=False,
         llm_backend="anthropic",
+        llm_model=None,
         config=None,
         command="ingest",
     )
@@ -303,6 +304,61 @@ def test_run_ingest_cli_wrapper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     exit_code = run_ingest(args)
     assert exit_code == 0
     assert (output_dir / "chunks.jsonl").exists()
+
+
+def test_ingest_passes_llm_model_to_factory(tmp_path: Path) -> None:
+    """--llm-model が llm_factory に {"model": ...} として渡ること."""
+    input_dir = tmp_path / "samples"
+    _write_sample(input_dir)
+    output_dir = tmp_path / "out"
+
+    captured: list[tuple[str, dict[str, Any] | None]] = []
+
+    def _capturing_factory(backend: str, config: dict[str, Any] | None):
+        captured.append((backend, config))
+        return _ScriptedLLM([])
+
+    cfg = IngestConfig(
+        input_dir=input_dir,
+        output_dir=output_dir,
+        skip_wiki=False,
+        llm_backend="ollama",
+        llm_model="qwen3:8b",
+    )
+    result = IngestRunner(
+        cfg,
+        analyzer_factory=lambda path: _StubAnalyzer(),
+        llm_factory=_capturing_factory,
+    ).run()
+    assert result.exit_code == 0
+    assert captured == [("ollama", {"model": "qwen3:8b"})]
+
+
+def test_ingest_omits_model_key_when_flag_absent(tmp_path: Path) -> None:
+    """--llm-model 未指定時は空 dict を渡してバックエンド既定値を使わせる."""
+    input_dir = tmp_path / "samples"
+    _write_sample(input_dir)
+    output_dir = tmp_path / "out"
+
+    captured: list[tuple[str, dict[str, Any] | None]] = []
+
+    def _capturing_factory(backend: str, config: dict[str, Any] | None):
+        captured.append((backend, config))
+        return _ScriptedLLM([])
+
+    cfg = IngestConfig(
+        input_dir=input_dir,
+        output_dir=output_dir,
+        skip_wiki=False,
+        llm_backend="anthropic",
+        llm_model=None,
+    )
+    IngestRunner(
+        cfg,
+        analyzer_factory=lambda path: _StubAnalyzer(),
+        llm_factory=_capturing_factory,
+    ).run()
+    assert captured == [("anthropic", {})]
 
 
 def test_retry_failed_and_force_regenerate_cooccur_warning(
@@ -319,6 +375,7 @@ def test_retry_failed_and_force_regenerate_cooccur_warning(
         force_regenerate=True,
         retry_failed=True,
         llm_backend="anthropic",
+        llm_model=None,
         config=None,
         command="ingest",
     )

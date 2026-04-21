@@ -7,18 +7,21 @@ name = "chunking"
 version = "0.1.0"
 description = "日本語 RAG 向けチャンク化 + TF-IDF + 固有名詞 Wiki CLI"
 readme = "README.md"
-requires-python = ">=3.11"
+# Python 3.13+ では transformers 4.25 系がピンする tokenizers<0.14 の
+# prebuilt wheel が未配布で、Rust ソースビルドにも失敗する. Ginza 5.2 が
+# このスタックに依存している以上、当面 3.11/3.12 のみ対応とする.
+requires-python = ">=3.11,<3.13"
 license = { text = "MIT" }
 authors = [{ name = "Scalar Labs" }]
 
 dependencies = [
-    "spacy>=3.7,<4",
+    # Ginza 5.2 の compound_splitter factory 登録は spacy 3.9 以降の
+    # Config 検証系で None 既定値が弾かれる可能性があるため上限を <3.9 に
+    # 保つ (3.8.x まで analyzer.py の runtime fix で吸収済み).
+    "spacy>=3.7,<3.9",
     "ginza>=5.2",
-    # F-023: reproducible build のため sha256 を pin したいが、オフラインのため未確定.
-    # ネットワーク利用時: curl -sL <url> | sha256sum で hex を取得し以下に付与する:
-    #   ja-ginza-electra @ https://.../ja_ginza_electra-5.2.0-py3-none-any.whl#sha256=<HASH>
-    # TODO: pin sha256 once a reproducible build hash is available
-    "ja-ginza-electra @ https://github.com/megagonlabs/ginza/releases/download/v5.2.0/ja_ginza_electra-5.2.0-py3-none-any.whl",
+    # F-023: sha256 ピンで tag 再利用や repo 改ざんに対する supply-chain 防衛.
+    "ja-ginza-electra @ https://github.com/megagonlabs/ginza/releases/download/v5.2.0/ja_ginza_electra-5.2.0-py3-none-any.whl#sha256=e407d95f656e140fe5bc1b36de08bc6843d73abb28cfbfb95714baafe09709fc",
     "sudachipy>=0.6",
     "sudachidict-core",
     "scikit-learn>=1.4",

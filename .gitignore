@@ -13,3 +13,4 @@ build/
 # Local ingest outputs
 out/
 *.npz
+.venv311/

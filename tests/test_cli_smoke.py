@@ -33,3 +33,13 @@ def test_ingest_default_backend_is_anthropic() -> None:
     parser = build_parser()
     args = parser.parse_args(["ingest", "in", "out"])
     assert args.llm_backend == "anthropic"
+    assert args.llm_model is None
+
+
+def test_ingest_accepts_llm_model_flag() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        ["ingest", "in", "out", "--llm-backend", "ollama", "--llm-model", "qwen3:8b"]
+    )
+    assert args.llm_backend == "ollama"
+    assert args.llm_model == "qwen3:8b"

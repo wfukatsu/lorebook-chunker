@@ -58,6 +58,16 @@ def _add_ingest(subparsers: argparse._SubParsersAction) -> None:
         help="LLM バックエンド (既定: anthropic)",
     )
     p.add_argument(
+        "--llm-model",
+        default=None,
+        metavar="MODEL",
+        help=(
+            "選択したバックエンドに渡すモデル名 (既定: バックエンド既定値). "
+            "例: --llm-backend ollama --llm-model qwen3:8b / "
+            "--llm-backend anthropic --llm-model claude-haiku-4-5"
+        ),
+    )
+    p.add_argument(
         "--format",
         choices=["human", "json"],
         default="human",

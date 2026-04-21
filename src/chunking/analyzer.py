@@ -270,16 +270,19 @@ class JapaneseAnalyzer:
 
     @classmethod
     def load_and_verify(cls, path: str | os.PathLike[str]) -> "JapaneseAnalyzer":
-        """analyzer.json を読み、現在のランタイムと照合して一致すれば復元."""
+        """analyzer.json を読み、現在のランタイム (defaults) と strict_match で突合.
+
+        意図: ingest 時と **同一の** ランタイム設定で query / lint / 再 ingest が
+        実行されていることを保証する. 従来実装は保存値をそのまま analyzer に
+        渡し返して build_config と比較していたため恒真 (改ざんや環境ドリフト
+        を検知できない) だった. 現在は現ランタイムの defaults で analyzer を
+        構築し、保存された strict_match と差分があれば raise する.
+        将来的にランタイム設定の上書き (config file 等) を足す場合、そこで
+        構築済みの analyzer を引数に取るバリアントを追加すること.
+        """
         with Path(path).open("r", encoding="utf-8") as f:
             saved = AnalyzerConfig.from_dict(json.load(f))
-        analyzer = cls(
-            model_name=saved.strict_match["model_name"],
-            split_mode=saved.strict_match["split_mode"],
-            pos_allowlist=saved.strict_match["pos_allowlist"],
-            stopwords=saved.strict_match["stopwords"],
-            tfidf_config=saved.tfidf,
-        )
+        analyzer = cls()  # defaults — 現在のランタイム状態を代表する
         current = analyzer.build_config()
         diffs = _strict_diff(saved.strict_match, current.strict_match)
         if diffs:
