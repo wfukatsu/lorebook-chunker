@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chunking"
+version = "0.1.0"
+description = "日本語 RAG 向けチャンク化 + TF-IDF + 固有名詞 Wiki CLI"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Scalar Labs" }]
+
+dependencies = [
+    "spacy>=3.7,<4",
+    "ginza>=5.2",
+    "ja-ginza-electra @ https://github.com/megagonlabs/ginza/releases/download/v5.2.0/ja_ginza_electra-5.2.0-py3-none-any.whl",
+    "sudachipy>=0.6",
+    "sudachidict-core",
+    "scikit-learn>=1.4",
+    "scipy>=1.11",
+    "numpy",
+    "anthropic>=0.34",
+    "ollama>=0.3",
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-mock>=3",
+]
+
+[project.scripts]
+chunking = "chunking.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+chunking = ["resources/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
