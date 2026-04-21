@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Iterator
 
-from chunking.schema import ChunkRecord
+from lorebook_chunker.schema import ChunkRecord
 
 logger = logging.getLogger(__name__)
 

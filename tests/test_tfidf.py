@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from scipy.sparse import csr_matrix
 
-from chunking.tfidf import TfidfBuilder
+from lorebook_chunker.tfidf import TfidfBuilder
 
 
 def ws_analyzer(text: str) -> list[str]:

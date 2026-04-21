@@ -1,0 +1,175 @@
+{
+  "reviewer": "testing",
+  "findings": [
+    {
+      "id": "T-001",
+      "severity": "high",
+      "confidence": 0.92,
+      "pre_existing": false,
+      "title": "Atomic-swap partial-failure path (_atomic_swap OSError branch) has no test",
+      "location": "src/chunking/ingest.py:_atomic_swap (lines 321-326)",
+      "description": "_atomic_swap has an OSError fallback branch that falls through to copytree+rmtree when os.rename fails (cross-device rename). No test exercises this branch; the existing test_ingest_atomic_swap_replaces_existing only verifies the normal rename path. The test_ingest_preserves_existing_output_on_failure in test_smoke.py tests ingest-level crash safety but not the OSError rename-failure path inside _atomic_swap itself.",
+      "why_it_matters": "The fallback copytree path is the only protection against cross-device swap; if it is silently broken (e.g., the backup is not cleaned up, or the copytree succeeds but the target rename fails) the output directory ends up corrupted. The branch is real and reachable in container environments where /tmp and the workspace are on different filesystems.",
+      "evidence": ["src/chunking/ingest.py lines 321-329: try: staging.rename(target) except OSError: shutil.copytree(staging, target); shutil.rmtree(staging)", "tests/test_ingest.py:test_ingest_atomic_swap_replaces_existing does not monkeypatch staging.rename"]
+    },
+    {
+      "id": "T-002",
+      "severity": "high",
+      "confidence": 0.88,
+      "pre_existing": false,
+      "title": "analyzer.json version-mismatch on query path is untested (compat_match only tested on ingest side)",
+      "location": "src/chunking/query.py:run_query_impl lines 66-73, src/chunking/analyzer.py:load_and_verify",
+      "description": "run_query_impl calls analyzer_factory(analyzer_path) inside a broad except-Exception block and returns exit_code=3 on any failure. The tests for AnalyzerVersionMismatchError are in test_analyzer.py and are Ginza-gated (requires_ginza). No test verifies that the query path correctly surfaces an AnalyzerVersionMismatchError (a compat_match mismatch) as a non-zero exit with a useful error message when running in stub/no-Ginza environments.",
+      "why_it_matters": "A corrupted or mis-versioned analyzer.json will silently swallow AnalyzerVersionMismatchError inside the broad except-Exception in query.py and return a confusing 'analyzer restore failed' message. The plan explicitly distinguishes strict_match vs compat_match semantics; the query-side mismatch handling is a separate code path from the ingest-side one.",
+      "evidence": ["src/chunking/query.py lines 65-73: except Exception as e: return QueryResult(exit_code=3, ...)", "tests/test_analyzer.py:test_analyzer_json_strict_mismatch is @requires_ginza; no Ginza-free analogue for query path exists"]
+    },
+    {
+      "id": "T-003",
+      "severity": "high",
+      "confidence": 0.85,
+      "pre_existing": false,
+      "title": "wiki budget_skipped + retry_failed = True interaction is untested",
+      "location": "src/chunking/wiki.py:_should_skip_due_to_cache lines 488-490",
+      "description": "The cache logic has a distinct branch for prior.status == 'budget_skipped': it skips unless retry_failed=True. test_wiki.py covers retry_failed for prior.status=='failed' but has no test that verifies budget_skipped entities are re-attempted when retry_failed=True (and skipped when retry_failed=False). The two branches are structurally identical in the source but represent different operational intentions.",
+      "why_it_matters": "A user who runs --retry-failed expecting to retry budget-exhausted entities from a prior run will silently get skipped behavior if this branch is mis-wired. The success criteria for Unit 7 include the retry/budget guards; this exact re-try path is enumerated.",
+      "evidence": ["src/chunking/wiki.py lines 484-490: 'budget_skipped' branch mirrors 'failed' branch", "tests/test_wiki.py:test_retry_failed_reattempts_prior_failures only exercises prior.status=='failed'"]
+    },
+    {
+      "id": "T-004",
+      "severity": "high",
+      "confidence": 0.82,
+      "pre_existing": false,
+      "title": "test_paraphrase_query_recorded is a no-op test that always passes regardless of query behavior",
+      "location": "tests/test_smoke.py lines 126-140",
+      "description": "test_paraphrase_query_recorded writes a report JSON and then asserts only that the file exists. It never asserts anything about the query's result content, hit count, or exit_code. The comment 'always passes' is explicit. This is categorized as a weak-assertion test that provides false confidence: it proves only that run_query_impl does not throw, not that it returns sensible results.",
+      "why_it_matters": "The test is described as a Unit 12 Success Criteria recorder. If run_query_impl returns exit_code != 0 or hits==[], the test still passes. It provides zero regression protection for the paraphrase query path.",
+      "evidence": ["tests/test_smoke.py lines 138-140: assert report_path.exists()  # 記録のみ、常にパス"]
+    },
+    {
+      "id": "T-005",
+      "severity": "medium",
+      "confidence": 0.80,
+      "pre_existing": false,
+      "title": "LLM retry exhaustion path in wiki results in None return, but test only checks stats.failed — does not verify manifest records failure_reason",
+      "location": "src/chunking/wiki.py:_record_failure (line 580), tests/test_wiki.py:test_retry_failed_reattempts_prior_failures",
+      "description": "When retries are exhausted, _record_failure is called with reason='retries exhausted'. The test verifies stats.failed==1 and that a subsequent run with retry_failed=True re-attempts the entity, but no test reads the produced manifest entry and asserts that failure_reason == 'retries exhausted' or that the .md file for the failed entity is absent (not written). These are distinct observable behaviors that could regress independently.",
+      "why_it_matters": "The manifest failure_reason field is read by the lint orphan_wiki check and by downstream tooling. If _record_failure silently drops the field or writes a blank string, no test catches it.",
+      "evidence": ["src/chunking/wiki.py line 594: failure_reason=reason", "tests/test_wiki.py:test_retry_failed_reattempts_prior_failures: checks stats counts only, never reads manifest entries"]
+    },
+    {
+      "id": "T-006",
+      "severity": "medium",
+      "confidence": 0.78,
+      "pre_existing": false,
+      "title": "--skip-wiki flag path in smoke test never exercises the real wiki module code path",
+      "location": "tests/test_smoke.py:_ingest_fixture (line 47)",
+      "description": "_ingest_fixture defaults to skip_wiki=True, meaning the majority of smoke tests (test_ingest_produces_all_expected_artifacts, test_literal_query_finds_relevant_chunk, test_paraphrase_query_recorded, test_lint_on_fixture_corpus_is_not_fatal) bypass the entire wiki generation path including ManifestStore initialization. The --skip-wiki code path writes an empty manifest, which is tested, but the interaction between skip_wiki and the wiki module's ManifestStore.load() is only exercised by test_ingest_plus_wiki_generates_entities (skip_wiki=False). This is fine in isolation, but the smoke tests as a group do not verify that skip_wiki=True produces a manifest.json file with correct structure.",
+      "why_it_matters": "The plan's Unit 12 specifies smoke tests 'cover the whole integration path'. The skip_wiki=True path produces a manifest.json with empty entries; no smoke test asserts that this file is parseable JSON with the expected schema keys (version, entries, etc.).",
+      "evidence": ["tests/test_smoke.py line 83-94: test_ingest_produces_all_expected_artifacts does not check entities/manifest.json structure", "src/chunking/wiki.py lines 355-361: skip_wiki branch writes manifest via ManifestStore.save()"]
+    },
+    {
+      "id": "T-007",
+      "severity": "medium",
+      "confidence": 0.75,
+      "pre_existing": false,
+      "title": "test_manifest_atomic_write_on_failure does not actually simulate a write failure — it only tests two sequential successful saves",
+      "location": "tests/test_wiki.py lines 432-445",
+      "description": "The test is named 'atomic_write_on_failure' but never injects a failure during save(). It saves once, asserts the content, saves again with a different status, and asserts the updated content. The OSError cleanup branch in ManifestStore.save() (lines 227-229: 'except Exception: os.unlink(tmp_path); raise') has no test that verifies the tempfile is cleaned up and the original manifest remains intact when json.dump raises mid-write.",
+      "why_it_matters": "The tempfile-based atomic write is specifically designed for power-loss / SIGKILL safety. If the cleanup branch is broken (e.g., tmp_path already unlinked, or the raise silently swallows), stale .tmp files accumulate or the manifest is left half-written. The test name implies coverage it does not provide.",
+      "evidence": ["tests/test_wiki.py lines 432-445: test body performs two successful saves, no exception injection", "src/chunking/wiki.py lines 226-229: except Exception: if os.path.exists(tmp_path): os.unlink(tmp_path); raise"]
+    },
+    {
+      "id": "T-008",
+      "severity": "medium",
+      "confidence": 0.72,
+      "pre_existing": false,
+      "title": "Unicode normalization boundary: composed vs decomposed CJK characters not tested",
+      "location": "tests/test_normalize.py",
+      "description": "test_normalize.py covers NFKC half-width conversion and IDEOGRAPHIC SPACE but does not test NFD/NFC composed vs decomposed sequences for CJK compatibility characters (e.g., U+FA2D 茶 composed vs U+8336 茶 canonical — both normalize to the same under NFKC). More practically: voiced Japanese kana in NFD form (e.g., か + combining dakuten U+3099 vs が U+304C) are not tested. If an upstream source provides NFD text, NFKC normalization should coalesce them, but there is no test confirming this.",
+      "why_it_matters": "The plan states char_start/char_end refer to post-normalization offsets. If NFD input is not fully normalized, offset-based entity span extraction in NER will produce wrong results silently.",
+      "evidence": ["tests/test_normalize.py: no test with NFD or combining character sequences", "src/chunking/normalize.py line 25: unicodedata.normalize('NFKC', s) — correct implementation, but untested boundary"]
+    },
+    {
+      "id": "T-009",
+      "severity": "medium",
+      "confidence": 0.70,
+      "pre_existing": false,
+      "title": "ingest_produces_artifacts smoke test does not verify row_index continuity across multi-file input",
+      "location": "tests/test_smoke.py lines 82-94",
+      "description": "test_ingest_produces_all_expected_artifacts checks that the first line of chunks.jsonl contains chunk_id, row_index, text, top_keywords. The fixture corpus has 4 files (01_news.txt through 04_fiction.txt). No test verifies that row_index values are globally sequential across all files (0, 1, 2, ..., N-1) rather than per-file-local. The chunker produces row_index within chunk_document calls; the ingest loop appends chunks from multiple files. If row indices restart per file, the vocab.npz matrix rows will be mis-indexed.",
+      "why_it_matters": "The plan states 'each chunk carries row_index that indexes into vocab.npz'. Misaligned row_index breaks cosine query results silently — query returns wrong chunks. The fixture is a multi-file corpus specifically suited to expose this.",
+      "evidence": ["tests/test_smoke.py line 90: only reads first row of chunks.jsonl", "src/chunking/chunker.py: row_index is set per chunk_document call — cross-file continuity depends on how IngestRunner accumulates all_chunks and reindexes before TF-IDF"]
+    },
+    {
+      "id": "T-010",
+      "severity": "low",
+      "confidence": 0.65,
+      "pre_existing": false,
+      "title": "conftest.py tiny_ja_corpus fixture is defined but not used by any test",
+      "location": "tests/conftest.py lines 7-14",
+      "description": "The tiny_ja_corpus fixture is the only shared fixture in conftest.py. A search across all test files shows no test function requests it as a parameter. All tests that need a corpus define their own inline data. The fixture is dead code.",
+      "why_it_matters": "Dead fixtures create confusion about the intended shared test infrastructure. More importantly, the fixture was presumably meant to be used by a test that was never written — suggesting a coverage gap where the fixture corpus was intended as a Ginza-free integration-level corpus for tests that do not currently exist.",
+      "evidence": ["tests/conftest.py lines 7-14: defines tiny_ja_corpus", "grep across tests/*.py: no test function lists tiny_ja_corpus as a parameter"]
+    },
+    {
+      "id": "T-011",
+      "severity": "low",
+      "confidence": 0.63,
+      "pre_existing": false,
+      "title": "test_cli_smoke.py does not test --skip-wiki flag parsing or --max-llm-calls argument",
+      "location": "tests/test_cli_smoke.py",
+      "description": "test_cli_smoke.py tests parser structure and default values but does not verify that --skip-wiki is accepted and results in args.skip_wiki==True, or that --max-llm-calls is accepted and results in a numeric args.max_llm_calls. These flags are central to the ingest pipeline control flow.",
+      "why_it_matters": "If --skip-wiki is silently renamed or mis-typed in cli.py (e.g., add_argument('--skip_wiki') instead of '--skip-wiki') the flag would be ignored at runtime with no error; the pipeline would always attempt wiki generation. The argparse test is the first gate against this class of typo.",
+      "evidence": ["tests/test_cli_smoke.py lines 1-36: no test for --skip-wiki or --max-llm-calls", "src/chunking/cli.py: contains these flags (inferred from ingest.py usage)"]
+    }
+  ],
+  "residual_risks": [
+    {
+      "id": "RR-001",
+      "description": "All non-Ginza tests use _StubAnalyzer which does not call normalize_text internally on tokenize_for_tfidf output. The real JapaneseAnalyzer presumably does. Any normalization-dependent behavior in TF-IDF (e.g., NFKC token deduplication) is never exercised in the stub-based pipeline tests.",
+      "confidence": 0.68
+    },
+    {
+      "id": "RR-002",
+      "description": "The fixture samples (tests/fixtures/samples/01-04.txt) are small enough (~10 lines each) that chunk boundaries from the stub splitter will differ significantly from Ginza sentence boundaries on real text. The smoke tests therefore do not validate chunking quality on real Japanese prose, only artifact existence.",
+      "confidence": 0.72
+    },
+    {
+      "id": "RR-003",
+      "description": "No test verifies that compute_source_hash output changes when prompt_template_version changes (a new PROMPT_TEMPLATE_VERSION constant). The hash function includes the version string, but the test suite does not exercise a version bump scenario.",
+      "confidence": 0.65
+    },
+    {
+      "id": "RR-004",
+      "description": "ManifestStore.save() calls os.fsync on the directory fd for POSIX durability. On macOS (the current OS per env), os.fsync on a directory fd is a no-op (returns 0 without error). No test verifies the fallback path handles this gracefully, nor is there a test for the Windows OSError/NotImplementedError catch.",
+      "confidence": 0.61
+    }
+  ],
+  "testing_gaps": [
+    {
+      "id": "TG-001",
+      "description": "No test exercises ingest exit_code=4 path (analyzer init failed). The exception handler at ingest.py line 160-165 is unreachable via the stub factory and has zero test coverage.",
+      "confidence": 0.82
+    },
+    {
+      "id": "TG-002",
+      "description": "No test exercises ingest exit_code=5 path (chunking produced 0 chunks). This requires all input files to be non-empty valid UTF-8 but produce no chunks after normalization — e.g., a file containing only whitespace after normalization. test_ingest_fails_on_empty_input_dir covers the no-files case (exit_code=2), not the zero-chunks case.",
+      "confidence": 0.80
+    },
+    {
+      "id": "TG-003",
+      "description": "No test exercises ingest exit_code=6 path (wiki generation aborted via LLMPermanentError from generate_all). The systemic failure in test_wiki.py raises LLMPermanentError, but no test verifies that IngestRunner catches it and returns exit_code=6 rather than exit_code=10.",
+      "confidence": 0.85
+    },
+    {
+      "id": "TG-004",
+      "description": "The _should_skip_due_to_cache branch where prior.source_hash != current_hash (cache miss due to changed source) has no dedicated test. test_force_regenerate_ignores_cache bypasses the hash check entirely; no test mutates chunk content between runs to cause a hash-driven re-generation.",
+      "confidence": 0.76
+    },
+    {
+      "id": "TG-005",
+      "description": "No test verifies that query.py returns a non-zero exit when chunks.jsonl row count mismatches vocab.npz matrix row count (exit_code=3 path at lines 82-89 of query.py). This corruption scenario is explicitly guarded but untested.",
+      "confidence": 0.78
+    }
+  ]
+}

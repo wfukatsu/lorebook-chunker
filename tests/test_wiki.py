@@ -7,14 +7,14 @@ from pathlib import Path
 import pytest
 import yaml
 
-from chunking.llm import (
+from lorebook_chunker.llm import (
     GenerateResult,
     LLMPermanentError,
     LLMPreflightError,
     LLMRetryableError,
 )
-from chunking.schema import ChunkRecord, EntityAggregate
-from chunking.wiki import (
+from lorebook_chunker.schema import ChunkRecord, EntityAggregate
+from lorebook_chunker.wiki import (
     ManifestStore,
     PROMPT_TEMPLATE_VERSION,
     SUMMARY_BODY_MARKER_BEGIN,
@@ -485,7 +485,7 @@ def test_manifest_corrupted_json_recovers_empty(tmp_path: Path) -> None:
 
 
 def _make_dummy_entry(status: str = "success"):
-    from chunking.wiki import ManifestEntry
+    from lorebook_chunker.wiki import ManifestEntry
     return ManifestEntry(
         entity_name="田中",
         ner_label="PERSON",

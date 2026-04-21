@@ -1,0 +1,144 @@
+{
+  "reviewer": "api-contract",
+  "findings": [
+    {
+      "id": "AC-001",
+      "priority": "P0",
+      "confidence": 0.97,
+      "pre_existing": false,
+      "title": "row_index in chunks.jsonl is per-document, not global matrix row — index is wrong for every document after the first",
+      "location": "src/chunking/chunker.py:82-91 + src/chunking/ingest.py:175-191",
+      "category": "breaking_contract",
+      "why_it_matters": "The plan contract (docs/plans section 'chunks.jsonl スキーマ') states row_index indexes the row in vocab.npz matrix. Ingest appends chunks from multiple documents into a single all_chunks list (global order) before calling TfidfBuilder.fit_transform. The matrix rows are 0-based across all chunks combined. But the chunker resets idx to 0 for each call to chunk_document, so the second document's first chunk gets row_index=0 again. The resulting chunks.jsonl maps row_index values that collide across documents and do not correspond to the actual matrix rows. Any downstream consumer (or query.py itself) that uses row_index to look up the sparse vector in vocab.npz will retrieve the wrong vector for every chunk from the second document onward.",
+      "evidence": [
+        "chunker.py:82-91: `for idx, (...) in enumerate(final_chunks): yield ChunkRecord(row_index=idx, ...)` — idx resets to 0 per document call",
+        "ingest.py:175-191: multiple `chunk_document` calls append to `all_chunks` without post-correcting row_index",
+        "ingest.py:206: `matrix, vocab, idf = tfidf.fit_transform(texts)` — matrix row 0 == all_chunks[0] globally, but chunk may carry row_index=0 for its own doc-local position",
+        "Plan KTD line 94: 'row_index (0-based、vocab.npz の matrix row と対応)'"
+      ],
+      "fix": "After assembling all_chunks (line 191 of ingest.py) and before TF-IDF, reassign global row_index: `for i, chunk in enumerate(all_chunks): chunk.row_index = i`. Alternatively move row_index assignment to after fit_transform in the orchestrator."
+    },
+    {
+      "id": "AC-002",
+      "priority": "P1",
+      "confidence": 0.92,
+      "pre_existing": false,
+      "title": "entities/*.md frontmatter missing required fields: status, last_attempt_at (timestamp), chunk_ids",
+      "location": "src/chunking/wiki.py:253-264 (_render_wiki_page)",
+      "category": "missing_required_fields",
+      "why_it_matters": "Plan R15 / Unit 7 frontmatter contract (line 631) explicitly enumerates required deterministic fields: entity_name, ner_label, status, タイムスタンプ, source_hash, ginza_model, llm_model, mention_count, chunk_count, chunk_ids, cooccurring_entities, ai_verification_status. The plan also states (KTD line 95 and line 124) that frontmatter is a redundant copy of manifest data for --retry-failed scan. Missing status means any consumer or tool that reads entity .md files to determine retry eligibility cannot do so without falling back to manifest.json. Missing chunk_ids means the documented cross-reference from wiki page to source chunks is broken for consumers that parse frontmatter rather than manifest.",
+      "evidence": [
+        "wiki.py:253-264: frontmatter dict contains entity_name, ner_label, mention_count, chunk_count, source_hash, ginza_model, llm_model, prompt_template_version, ai_verification_status, cooccurring_entities — no status, last_attempt_at, or chunk_ids keys",
+        "Plan line 631: 'frontmatter は deterministic フィールド (entity_name, ner_label, status, タイムスタンプ, source_hash, ginza_model, llm_model, mention_count, chunk_count, chunk_ids, cooccurring_entities, ai_verification_status) のみ'",
+        "Plan KTD line 95: 'entities/manifest.json を主(正)、個別 wiki の frontmatter にも同値を冗長記録'"
+      ],
+      "fix": "Add to frontmatter dict in _render_wiki_page: `'status': entry.status`, `'last_attempt_at': entry.last_attempt_at`, `'chunk_ids': entry.chunk_ids`."
+    },
+    {
+      "id": "AC-003",
+      "priority": "P1",
+      "confidence": 0.88,
+      "pre_existing": false,
+      "title": "entities/manifest.json entries emit failure_reason field not present in plan contract schema",
+      "location": "src/chunking/wiki.py:216 (ManifestStore.save uses asdict), src/chunking/wiki.py:110-120 (ManifestEntry dataclass)",
+      "category": "undocumented_field_in_stable_contract",
+      "why_it_matters": "The plan manifest.json schema (lines 251-262) defines exactly which fields each entry contains. ManifestEntry includes failure_reason which is serialized via dataclasses.asdict into every entry on disk — including success entries where failure_reason is the empty string ''. Consumers that strictly validate or round-trip the manifest schema will encounter an unexpected field. More importantly, ManifestStore.load deserializes with ManifestEntry(**raw), so any existing manifest written without failure_reason will raise TypeError on load after this schema is deployed (backward-load break).",
+      "evidence": [
+        "wiki.py:119: `failure_reason: str = ''` in ManifestEntry dataclass",
+        "wiki.py:216: `'entries': {k: asdict(v) for k, v in self._entries.items()}` — asdict includes failure_reason",
+        "wiki.py:188: `self._entries[key] = ManifestEntry(**raw)` — if raw lacks failure_reason key, this is fine (default=''), but if raw has unknown keys from a future schema version, it will TypeError",
+        "Plan manifest schema lines 251-262: no failure_reason field listed"
+      ],
+      "fix": "Either add failure_reason to the plan schema (making it officially part of the contract) or exclude it from serialization using a custom to_dict method that only emits plan-specified fields. Also add `failure_reason=raw.get('failure_reason', '')` in ManifestStore.load to handle forward/backward compatibility."
+    },
+    {
+      "id": "AC-004",
+      "priority": "P1",
+      "confidence": 0.85,
+      "pre_existing": false,
+      "title": "lint exit code returns 1 for any fatal finding but never 2; plan prompt specifies fatal=2 distinct from warning=1",
+      "location": "src/chunking/lint.py:293 (run_lint)",
+      "category": "exit_code_contract",
+      "why_it_matters": "The task specification states lint exit codes should be fatal=2, warning=1, success=0. The plan text says 'fatal >= 1 → 非0' (non-zero) without specifying the exact value. The implementation returns `1` for any fatal count >= 1 and `0` otherwise — warnings never produce a non-zero exit. CI pipelines, shell scripts, and downstream tools that test for exit code 2 to distinguish fatal from warning will misclassify all lint results. This is a documented CLI contract (R11/R12) that downstream orchestration depends on.",
+      "evidence": [
+        "lint.py:293: `return 0 if report.count(FATAL) == 0 else 1` — warning-only runs exit 0, not 1",
+        "Plan line 768: 'exit code: 致命 0 件 → 0、致命 >= 1 → 非 0' — does not specify separate warning exit code",
+        "Task specification: 'lint fatal=2, warning=1, success=0'"
+      ],
+      "fix": "Update run_lint: `if report.count(FATAL) > 0: return 2; if report.count(WARNING) > 0: return 1; return 0`. Update plan to canonicalize fatal=2, warning=1, success=0 if that is the intended contract."
+    },
+    {
+      "id": "AC-005",
+      "priority": "P2",
+      "confidence": 0.75,
+      "pre_existing": false,
+      "title": "analyzer.json tfidf block emits sublinear_tf and top_keywords fields not in plan schema",
+      "location": "src/chunking/tfidf.py:149-155 (_build_config)",
+      "category": "undocumented_schema_extension",
+      "why_it_matters": "The plan analyzer.json schema (lines 293-298) shows tfidf containing only min_df and max_df. The implementation writes sublinear_tf and top_keywords as well. These extra fields do not break the read path (query.py and lint.py only check for strict_match/compat_match presence), but any downstream schema validator or consumer that treats the plan schema as a closed object will reject or misparse the file. The plan states chunks.jsonl schema is a stable ScalarDB-bound contract; analyzer.json is similarly consumed by query and lint.",
+      "evidence": [
+        "tfidf.py:149-155: _build_config returns min_df, max_df, sublinear_tf, top_keywords",
+        "Plan lines 293-298: tfidf block shows only min_df and max_df"
+      ],
+      "fix": "Either update the plan schema to include sublinear_tf and top_keywords as documented fields, or keep them under a separate key (e.g., tfidf_extra) to maintain a clean plan-aligned surface."
+    },
+    {
+      "id": "AC-006",
+      "priority": "P2",
+      "confidence": 0.72,
+      "pre_existing": false,
+      "title": "ingest does not emit identity banner to stderr at execution start (R9); only --help carries the banner",
+      "location": "src/chunking/ingest.py:424-458 (run_ingest), src/chunking/cli.py:8-11",
+      "category": "missing_required_behavior",
+      "why_it_matters": "Plan R9 requires an identity banner on ingest start. The IDENTITY_BANNER constant is used as description= in argparse subparser definitions, so it appears only in --help output. run_ingest does not print the banner before processing begins. Automated consumers that parse stderr for the banner to confirm which tool version is running (e.g., log scrapers, CI artifact validators) will not find it in normal execution output.",
+      "evidence": [
+        "cli.py:8-11: IDENTITY_BANNER defined",
+        "cli.py:14-19, 35-44, 46-52: description=IDENTITY_BANNER used in add_parser calls — appears in --help only",
+        "ingest.py:424-458: run_ingest prints only warn/error/OK lines, no banner at start",
+        "Plan line 32: 'R9 (ingest CLI + エッジケース + --skip-wiki + identity バナー)'",
+        "Plan line 361: 'CLI は --help 出力にも identity バナーを1行入れる (R9 の要件)' — ambiguously only mentions --help"
+      ],
+      "fix": "Add `print(IDENTITY_BANNER, file=sys.stderr)` at the top of run_ingest (before processing) to emit the banner on every execution, satisfying R9's documented intent and the plan test at line 368."
+    }
+  ],
+  "residual_risks": [
+    {
+      "id": "RR-001",
+      "description": "ManifestStore.load uses ManifestEntry(**raw) for deserialization. If a manifest written by a future version adds new fields to entries, loading with the current code will raise TypeError. No version guard or **kwargs safety is present.",
+      "affected_artifact": "entities/manifest.json",
+      "confidence": 0.70
+    },
+    {
+      "id": "RR-002",
+      "description": "The plan states 'source_hash' in frontmatter is a redundant copy of manifest data, but with status/chunk_ids missing (AC-002), the frontmatter is no longer a full redundant copy. If --retry-failed ever needs to scan .md files instead of manifest.json, the missing fields will cause silent incorrect retry behavior.",
+      "affected_artifact": "entities/*.md frontmatter",
+      "confidence": 0.68
+    },
+    {
+      "id": "RR-003",
+      "description": "The compat_match warning in _warn_compat_mismatch checks only ('ginza', 'spacy', 'sudachipy', 'sudachidict_package_version') — it omits 'sudachidict_package' (package name itself). If the package name changes (e.g., sudachidict_full replaces sudachidict_core), no warning fires even though tokenization would differ.",
+      "affected_artifact": "analyzer.json compat_match validation",
+      "confidence": 0.65
+    }
+  ],
+  "testing_gaps": [
+    {
+      "id": "TG-001",
+      "description": "No test verifies that row_index values in chunks.jsonl are globally correct across a multi-document ingest (i.e., chunk N from document 2 has row_index matching its position in the global all_chunks list, not its position within document 2). This gap hides AC-001.",
+      "affected_contract": "chunks.jsonl row_index <-> vocab.npz matrix row correspondence",
+      "confidence": 0.95
+    },
+    {
+      "id": "TG-002",
+      "description": "No test parses entities/*.md frontmatter YAML and asserts all plan-required fields (status, last_attempt_at, chunk_ids) are present. Frontmatter contract is checked only implicitly by the wiki page rendering tests.",
+      "affected_contract": "entities/*.md frontmatter schema (R15)",
+      "confidence": 0.88
+    },
+    {
+      "id": "TG-003",
+      "description": "No test asserts lint exit code is 2 (vs 1 or any non-zero) when a fatal finding is present, and no test asserts exit code 1 when only warnings are present. Exit code semantics are tested only as 'non-zero for fatal'.",
+      "affected_contract": "lint CLI exit codes",
+      "confidence": 0.82
+    }
+  ]
+}

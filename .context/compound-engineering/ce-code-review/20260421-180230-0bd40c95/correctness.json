@@ -1,0 +1,196 @@
+{
+  "reviewer": "correctness",
+  "findings": [
+    {
+      "id": "COR-001",
+      "title": "Staging directory leaked on LLMPermanentError (systemic failure abort)",
+      "severity": "P1",
+      "file": "src/chunking/ingest.py",
+      "line": 252,
+      "confidence": 0.95,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "After the `except LLMPermanentError` handler sets exit_code=6, add `shutil.rmtree(staging, ignore_errors=True)` before `return result`. Alternatively restructure so LLMPermanentError propagates to the outer `except Exception` handler which already does cleanup.",
+      "why_it_matters": "When wiki.generate_all() raises LLMPermanentError (systemic failure path), the handler at line 252-255 returns early WITHOUT cleaning up the staging directory. On the next ingest run the stale staging dir is deleted (line 142), so data is not permanently lost, but the previous run leaves a partial staging dir that may confuse operators and wastes disk space. More critically, the outer `except Exception` at line 278 is bypassed, so any monitoring/logging that happens there is also skipped.",
+      "evidence": [
+        "ingest.py:250-255: `except LLMPermanentError` catches and returns without cleanup",
+        "ingest.py:278-283: outer handler does `shutil.rmtree(staging, ignore_errors=True)` but is never reached for this path",
+        "ingest.py:140-143: staging dir is created unconditionally, never cleaned up in the LLMPermanentError path"
+      ]
+    },
+    {
+      "id": "COR-002",
+      "title": "pre-flight call consumed from max_llm_calls budget — off-by-one exhausts budget with max_llm_calls=1",
+      "severity": "P2",
+      "file": "src/chunking/wiki.py",
+      "line": 385,
+      "confidence": 0.92,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Change `budget_consumed = stats.preflight_called + stats.attempted` to `budget_consumed = stats.attempted`. The pre-flight is infrastructure overhead, not a user-visible entity call, and `--max-llm-calls` is documented as controlling entity generation calls. If consuming pre-flight from the budget is intentional, document it explicitly in the CLI help.",
+      "why_it_matters": "`stats.preflight_called` is `bool`. In Python, `True + 0 == 1`. So when `max_llm_calls=1`, `budget_consumed = 1 + 0 = 1 >= 1` on the very first entity, and every entity is immediately `budget_skipped`. Users setting `--max-llm-calls 1` get zero entity wiki pages. The plan says `--max-llm-calls` controls \"high-value entity first\" consumption — the pre-flight is not part of that count.",
+      "evidence": [
+        "wiki.py:385: `budget_consumed = stats.preflight_called + stats.attempted`",
+        "wiki.py:147: `preflight_called: bool = False`",
+        "wiki.py:373: `stats.preflight_called = True` — set before the entity loop",
+        "wiki.py:386: `budget_consumed >= self._config.max_llm_calls` check fires immediately for max_llm_calls=1"
+      ]
+    },
+    {
+      "id": "COR-003",
+      "title": "normalize_text missing global trim — violates stated output contract",
+      "severity": "P2",
+      "file": "src/chunking/normalize.py",
+      "line": 20,
+      "confidence": 0.90,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add `s = s.strip()` (or `s = s.strip('\\n ')`) as the last step in `normalize_text`, and add `\"trim\": True` to `NORMALIZATION_SPEC`. Update the test in `test_normalize.py::test_mixed_real_world` whose expected value currently embeds a leading space.",
+      "why_it_matters": "The plan (`docs/plans/2026-04-21-001-feat-japanese-rag-chunking-plan.md`, lines 159, 200, 232, 403) specifies normalization as \"NFKC+LF+trim+collapse\" and gives the concrete example `normalize_text(\"Ｃａｆｅ　\\r\\n  \\r\\n テスト \")` → `\"Cafe\\nテスト\"`. The implementation does NOT strip, so leading/trailing whitespace/newlines survive into chunk text and `source_hash` inputs. The NORMALIZATION_SPEC dict also lacks a `\"trim\"` key, meaning the stored analyzer.json will not record this step. Downstream consumers expecting clean chunk text (e.g., RAG retrievers) receive chunks with leading/trailing newlines.",
+      "evidence": [
+        "normalize.py:20-29: no `s.strip()` call anywhere",
+        "normalize.py:32-37: NORMALIZATION_SPEC has no 'trim' key",
+        "plan line 403: explicit happy-path example requires trim",
+        "test_normalize.py:67-68: test_mixed_real_world expected has leading space ' Hello 世界' — test written to match the buggy behavior"
+      ]
+    },
+    {
+      "id": "COR-004",
+      "title": "vocab.npz config_json round-trip: str() on 0-d object array wraps in array repr",
+      "severity": "P2",
+      "file": "src/chunking/tfidf.py",
+      "line": 141,
+      "confidence": 0.78,
+      "autofix_class": "gated_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "pre_existing": false,
+      "suggested_fix": "Change line 141 from `json.loads(str(data[\"config_json\"]))` to `json.loads(str(data[\"config_json\"].item()))`. The `.item()` call extracts the Python scalar from the 0-d numpy object array, avoiding reliance on `str()` stringifying the scalar directly. Alternatively, save as `np.bytes_` or use `json.loads(data[\"config_json\"].item())` directly.",
+      "why_it_matters": "`np.savez_compressed` saves `np.array(json_str, dtype=object)` as a 0-d object array. When loaded, `data[\"config_json\"]` is a 0-d `np.ndarray`. `str()` on a 0-d object array calls `__str__` on the array, which in numpy >= 1.14 delegates to the contained object's `__str__`, giving the raw string. However this is an implementation detail of numpy — the canonical approach is `.item()` to extract the Python scalar. If numpy ever changes this behavior, `str()` could return something like `array('...', dtype=object)` causing `json.loads` to fail.",
+      "evidence": [
+        "tfidf.py:123: `config_json=np.array(json.dumps(config), dtype=object)` — 0-d object array",
+        "tfidf.py:141: `json.loads(str(data[\"config_json\"]))` — relies on str() on 0-d array giving scalar str",
+        "numpy docs: `.item()` is the documented way to extract Python scalar from 0-d array"
+      ]
+    },
+    {
+      "id": "COR-005",
+      "title": "chunk accumulation buf_len underestimates true chunk length — gap between sentences not counted",
+      "severity": "P3",
+      "file": "src/chunking/chunker.py",
+      "line": 158,
+      "confidence": 0.80,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Change the buffer length tracking to use the actual span of the buffer: after appending a sentence, compute `buf_len = buf_end - buf_start` instead of `buf_len += sent_len`. This ensures gaps between sentences (whitespace, empty lines preserved in normalized text) are counted toward the flush threshold. Check that `max_chunk_chars` guard is also applied to the accumulated buffer, not just individual sentences.",
+      "why_it_matters": "When normalized text has gaps between sentences (e.g., paragraph breaks as `\\n\\n`), `sent_len = end - start` measures sentence characters only. The gap characters between `buf_end` of one sentence and `start` of the next are not added to `buf_len`. The flush decision `buf_len >= target_chars` can delay flushing, causing the yielded chunk text `normalized_text[buf_start:buf_end]` to be substantially larger than `target_chars`. In Japanese text with structural formatting, multi-line gaps between short sentences can cause chunks to grow several times `target_chars` before flush.",
+      "evidence": [
+        "chunker.py:131: `buf_len = 0` initialized to 0",
+        "chunker.py:158: `buf_len += sent_len` only adds sentence char count, not inter-sentence gap",
+        "chunker.py:160: `yield (buf_start, buf_end, normalized_text[buf_start:buf_end])` — yielded text includes the gap",
+        "chunker.py:134: `max_chunk_chars` only applied to individual sentences, not accumulated buffers"
+      ]
+    },
+    {
+      "id": "COR-006",
+      "title": "BIO span walker silently drops I- tag on label mismatch — not a bug, but missed I-tag without prior B- is also silently dropped",
+      "severity": "P3",
+      "file": "src/chunking/analyzer.py",
+      "line": 154,
+      "confidence": 0.70,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "suggested_fix": "Add a debug-level log line in the `else` branch when `tag.startswith('I-')` but `current_label != tag[2:]` or `start_char is None`. This makes invalid BIO sequences observable without changing behavior. If Ginza can emit stand-alone I- tags (e.g. after pipeline errors), silently dropping them could cause missed entity spans.",
+      "why_it_matters": "If Ginza emits a stray `I-ORG` token without a preceding `B-ORG` (current_label is None or different), the condition at line 154 is False and the token falls to `else`, resetting state without emitting. The entity span is silently lost. While standard BIO guarantees this won't happen in well-formed output, Ginza tokenization edge cases (e.g. compound words split across chunk boundaries) could produce invalid sequences.",
+      "evidence": [
+        "analyzer.py:154: `elif tag.startswith('I-') and current_label == tag[2:] and start_char is not None:` — all three conditions must be True",
+        "analyzer.py:157-161: else branch resets state, no logging for the I-mismatch case"
+      ]
+    },
+    {
+      "id": "COR-007",
+      "title": "_atomic_swap backup collision: if backup dir already exists from a previous crash, rmtree is called but a concurrent process could have recreated it",
+      "severity": "P3",
+      "file": "src/chunking/ingest.py",
+      "line": 317,
+      "confidence": 0.62,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "suggested_fix": "This is inherently a TOCTOU window — fully eliminating it requires a file lock. For the single-process use case, the current logic is acceptable. Add a comment explaining that concurrent ingests are not supported. If concurrent use is needed, use a lockfile before entering `_atomic_swap`.",
+      "why_it_matters": "Between the `backup.exists()` check and `shutil.rmtree(backup)`, another process or OS action could affect the backup path. On single-user CLI this is very unlikely, but the code comments describe the operation as 'best-effort' without noting this gap. More practically: if a previous ingest crashed after renaming target→backup but before renaming staging→target, a subsequent ingest will rmtree the backup. This destroys the previous output permanently rather than preserving it as a recovery option.",
+      "evidence": [
+        "ingest.py:317-320: check-then-act on backup existence",
+        "ingest.py:308: comment says 'best-effort' but doesn't note the permanent data loss risk on crash recovery"
+      ]
+    }
+  ],
+  "residual_risks": [
+    {
+      "id": "RR-001",
+      "description": "ManifestStore.load() uses ManifestEntry(**raw) — if future schema adds required fields, loading old manifests will raise TypeError instead of gracefully migrating.",
+      "severity": "low",
+      "file": "src/chunking/wiki.py",
+      "line": 188
+    },
+    {
+      "id": "RR-002",
+      "description": "TfidfBuilder.rebuild_vectorizer sets idf_ after fitting on a dummy corpus. If scikit-learn changes its internal TfidfTransformer API, the idf injection will silently fail (scores revert to dummy-corpus IDF). No version pin or assertion guards this.",
+      "severity": "medium",
+      "file": "src/chunking/tfidf.py",
+      "line": 176
+    },
+    {
+      "id": "RR-003",
+      "description": "Ollama OllamaLLMClient raises generic Exception for non-connection errors and classifies them as LLMRetryableError unless 'not found' / 'pull' is in the message. A server-side permanent error (e.g. model deleted) may be retried 3 times unnecessarily.",
+      "severity": "low",
+      "file": "src/chunking/llm/ollama_client.py",
+      "line": 63
+    },
+    {
+      "id": "RR-004",
+      "description": "cosine similarity in query.py assumes vocab.npz matrix is L2-normalized (comment says TfidfVectorizer norm='l2' default). If the matrix was built with norm=None (e.g. user passes custom config), scores are dot products, not cosine similarities, and top-K ranking is incorrect but silently wrong.",
+      "severity": "low",
+      "file": "src/chunking/query.py",
+      "line": 113
+    }
+  ],
+  "testing_gaps": [
+    {
+      "id": "TG-001",
+      "description": "No test verifies that LLMPermanentError raised from wiki.generate_all() results in staging directory cleanup. The staging leak (COR-001) would not be caught.",
+      "file": "tests/test_ingest.py"
+    },
+    {
+      "id": "TG-002",
+      "description": "No test for max_llm_calls=1 behavior. COR-002 (pre-flight consuming the budget) would not be caught.",
+      "file": "tests/test_wiki.py"
+    },
+    {
+      "id": "TG-003",
+      "description": "test_normalize.py::test_mixed_real_world expected value has a leading space — the test was written to match the non-trimming implementation, not the spec. Adding trim to normalize_text would correctly break this test, but the test needs updating.",
+      "file": "tests/test_normalize.py"
+    },
+    {
+      "id": "TG-004",
+      "description": "No test for vocab.npz round-trip with special characters in config_json (e.g. non-ASCII keys). COR-004 (str() on 0-d array) would only surface on numpy version changes.",
+      "file": "tests/test_tfidf.py"
+    },
+    {
+      "id": "TG-005",
+      "description": "No test for chunker behavior when sentences have large inter-sentence gaps (COR-005). A corpus where buf_len is far smaller than the actual chunk text length should be tested.",
+      "file": "tests/test_chunker.py"
+    }
+  ]
+}

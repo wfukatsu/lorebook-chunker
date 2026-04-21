@@ -1,0 +1,344 @@
+{
+  "reviewer": "adversarial",
+  "findings": [
+    {
+      "id": "ADV-001",
+      "title": "Atomic swap: cross-filesystem rename silently falls back to copytree while second ingest process reads stale output_dir",
+      "severity": "high",
+      "confidence": 0.82,
+      "pre_existing": false,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "file": "src/chunking/ingest.py",
+      "lines": "306-328",
+      "why_it_matters": "Two concurrent ingest processes (e.g. cron + manual re-run) on a cross-filesystem mount (staging dir on /tmp, output_dir on NFS or a different local volume) trigger the OSError fallback at line 325 which does shutil.copytree instead of an atomic os.rename. During the copytree window (potentially seconds for a large corpus), a second process that already passed the staging.exists() check at line 141 will shutil.rmtree its own staging dir—but the original process is mid-copy into output_dir. Neither process detects the other. The final output_dir may contain a mix of files from both runs: old chunks.jsonl with new vocab.npz, or an entity wiki from run-2 overwriting files that run-1 is currently copying.",
+      "evidence": [
+        "Process A starts, creates output.staging, builds all artifacts.",
+        "output_dir is on NFS; output.staging is on local /tmp. At line 321, staging.rename(target) raises OSError(errno.EXDEV).",
+        "Process A falls into the except block at line 324 and begins shutil.copytree(staging, target) — this takes 3 seconds for a 10 MB corpus.",
+        "Process B starts at line 140, sees staging does not exist (Process A already renamed/deleted it), creates its own fresh staging dir, completes processing, reaches _atomic_swap.",
+        "Process B's target already partially exists (Process A's partial copytree). Process B calls target.rename(backup) at line 320, moving Process A's partial output_dir to output.backup, then renames its own staging to output_dir.",
+        "Process A's copytree is still writing into what is now output.backup (the moved path), not output_dir. Process A finishes, then deletes output.backup at line 327, destroying Process B's already-installed output_dir backup.",
+        "Final state: output_dir contains Process B's output. Process A's work is lost. No error is reported by either process."
+      ]
+    },
+    {
+      "id": "ADV-002",
+      "title": "Atomic swap: .backup directory left on disk after Ctrl-C between target.rename(backup) and staging.rename(target)",
+      "severity": "medium",
+      "confidence": 0.88,
+      "pre_existing": false,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "file": "src/chunking/ingest.py",
+      "lines": "316-328",
+      "why_it_matters": "If the process is killed (SIGKILL, OOM, power loss) between line 320 (target.rename(backup)) and line 322 (staging.rename(target)), the output_dir ceases to exist and output.backup holds the last good state. On the next run, line 318-319 detects output.backup exists and does shutil.rmtree(backup) BEFORE attempting the rename—destroying the last good output permanently. The user loses their previous clean corpus with no warning.",
+      "evidence": [
+        "Run 1 completed successfully; output_dir exists with good data.",
+        "Run 2 starts. At line 320, output_dir is renamed to output.backup. Process is killed via OOM before line 322 can execute.",
+        "output_dir no longer exists. output.backup holds the last good state.",
+        "Run 3 starts. At line 318-319: backup = output.with_name('output.backup'); backup.exists() → True; shutil.rmtree(backup) executes.",
+        "The only surviving good corpus is now deleted. staging.rename(target) then installs Run 3's output, which may differ or may fail.",
+        "User has no way to recover Run 1's output."
+      ]
+    },
+    {
+      "id": "ADV-003",
+      "title": "LLM response containing \\n---\\n breaks wiki page YAML frontmatter boundary causing yaml.safe_load to mis-parse subsequent re-reads",
+      "severity": "high",
+      "confidence": 0.85,
+      "pre_existing": false,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "file": "src/chunking/wiki.py",
+      "lines": "244-291",
+      "why_it_matters": "_render_wiki_page assembles the wiki file by placing raw result.text (the LLM response) between the SUMMARY_BODY_MARKER_BEGIN and SUMMARY_BODY_MARKER_END HTML comment markers. If the LLM returns a response that contains a line consisting solely of `---`, the written .md file will have a triple-dash line in the body. Any downstream tool that processes the file as YAML-frontmatter-bounded Markdown (e.g. mkdocs, obsidian, or the lint checker reading the file) will parse from the opening `---` to the first subsequent `---` line it finds, which is now inside the LLM body text. This truncates the real frontmatter at the LLM-injected line, making source_hash, entity_name, etc. inaccessible or wrong.",
+      "evidence": [
+        "Entity 'ScalarDB' triggers LLM generation. LLM responds with a summary that includes the markdown horizontal rule `---` on its own line (common in formatted markdown outputs).",
+        "_render_wiki_page at line 280 appends summary_body.strip() verbatim between the comment markers.",
+        "The written file has structure: `---\\n<real frontmatter>\\n---\\n\\n# ScalarDB...\\n<!-- summary-begin -->\\n2文目の要約。\\n---\\n続きの要約。\\n<!-- summary-end -->`",
+        "Any YAML parser that reads from `---` to next `---` now sees only `<real frontmatter>` as valid YAML and everything from the injected `---` onward is ignored.",
+        "lint.py's _load_success_entries reads manifest.json (unaffected), but any tool re-reading .md wiki files by frontmatter will receive truncated or empty frontmatter dicts, making source_hash lookups return None and causing unconditional regeneration on every run."
+      ]
+    },
+    {
+      "id": "ADV-004",
+      "title": "LLM returns fake YAML frontmatter block that overrides real frontmatter when files are re-parsed by downstream tools",
+      "severity": "medium",
+      "confidence": 0.72,
+      "pre_existing": false,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "file": "src/chunking/wiki.py",
+      "lines": "265-291",
+      "why_it_matters": "Because result.text is embedded verbatim without sanitization, an adversarially-controlled or hallucinating LLM can include a complete YAML block in its response. Combined with the --- boundary issue (ADV-003), a payload like `---\\nsource_hash: aaaaaa\\nstatus: success\\n---` in the body would be parsed by naive frontmatter readers as the authoritative frontmatter, setting source_hash to a value that always matches, permanently suppressing regeneration for that entity regardless of content changes.",
+      "evidence": [
+        "LLM generates response text containing: `以下の通り。\\n---\\nsource_hash: 0000000000000000000000000000000000000000000000000000000000000000\\n---\\n実際の要約。`",
+        "Written .md file now contains two `---`-delimited blocks.",
+        "Downstream RAG tooling that uses a YAML frontmatter parser to extract source_hash from wiki files (e.g. for incremental update decisions) reads the injected block, not the real one.",
+        "source_hash mismatch detection is bypassed; the entity page is never regenerated even when corpus content changes."
+      ]
+    },
+    {
+      "id": "ADV-005",
+      "title": "Entity name with path traversal characters sanitized to underscores produces filename collision across distinct entities",
+      "severity": "medium",
+      "confidence": 0.83,
+      "pre_existing": false,
+      "autofix_class": "manual",
+      "owner": "human",
+      "file": "src/chunking/ner.py",
+      "lines": "140-161",
+      "why_it_matters": "sanitize_entity_filename replaces all characters matching [/\\\\:*?\"<>|\\s] with underscore. Two distinct entity names that differ only in these unsafe characters produce the same sanitized filename. Entity 'A/B' (ORG) and 'A\\B' (ORG) both produce ORG__A_B.md. The second _record_success write silently overwrites the first wiki page with different content but the manifest.json retains both entries pointing to the same filename. After the atomic swap, lint sees no issue because both manifest entries show status=success, but the wiki page for whichever entity was written first is permanently gone.",
+      "evidence": [
+        "Corpus contains references to two organizations: 'A/B Corp' and 'A\\\\B Corp' (e.g. a company with a slash-separated division name and its subsidiary with a backslash variant).",
+        "Both pass NER extraction and aggregation thresholds.",
+        "sanitize_entity_filename('ORG', 'A/B Corp') → 'ORG__A_B_Corp.md'.",
+        "sanitize_entity_filename('ORG', 'A\\\\B Corp') → 'ORG__A_B_Corp.md' (identical).",
+        "_record_success for entity 1 writes ORG__A_B_Corp.md with entity 1's summary.",
+        "_record_success for entity 2 calls out_path.write_text() on the same path, overwriting entity 1's wiki page.",
+        "manifest.json has two entries, both with status=success, both referencing different chunk_ids. But there is only one .md file, containing entity 2's content.",
+        "No error or warning is raised."
+      ]
+    },
+    {
+      "id": "ADV-006",
+      "title": "Budget counter double-counts pre-flight: max_llm_calls=1 consumes entire budget on pre-flight, every entity is budget_skipped with empty source_hash",
+      "severity": "high",
+      "confidence": 0.92,
+      "pre_existing": false,
+      "autofix_class": "manual",
+      "owner": "human",
+      "file": "src/chunking/wiki.py",
+      "lines": "383-390",
+      "why_it_matters": "At line 385, budget_consumed = stats.preflight_called + stats.attempted. preflight_called is True (1) before any entity loop iteration. With max_llm_calls=1, budget_consumed is 1 >= 1 on the first loop iteration, so every entity is immediately budget_skipped. _record_budget_skip stores source_hash_prior = '' (empty string, from a None prior). On re-run without --retry-failed, _should_skip_due_to_cache finds prior.source_hash=='' != current_hash (a real SHA-256), so skip returns False—the entity would attempt generation again. But budget_consumed is still 1 on re-run. Result: every run with max_llm_calls=1 silently budget-skips all entities and persists empty source_hash strings that prevent effective caching.",
+      "evidence": [
+        "User runs: python -m chunking ingest --max-llm-calls 1 input/ output/",
+        "_preflight() executes (1 LLM call). stats.preflight_called = True.",
+        "Loop iteration i=1 (first entity): budget_consumed = True + 0 = 1. 1 >= 1 → _record_budget_skip called.",
+        "_record_budget_skip: prior = None; source_hash_prior = ''. ManifestEntry stored with source_hash=''.",
+        "All N entities get budget_skipped with source_hash=''.",
+        "Re-run without --retry-failed: _should_skip_due_to_cache sees prior.source_hash='' != current real hash → returns False (will not skip). budget_consumed still 1 on first entity → budget_skip again.",
+        "Infinite loop of budget-skipping with no wiki ever generated, and no error message indicating why."
+      ]
+    },
+    {
+      "id": "ADV-007",
+      "title": "max_llm_calls=0 passes None-check, pre-flight executes (consuming 1 real LLM call), then all entities are budget_skipped",
+      "severity": "medium",
+      "confidence": 0.88,
+      "pre_existing": false,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "file": "src/chunking/wiki.py",
+      "lines": "383-390",
+      "why_it_matters": "The budget guard is `if self._config.max_llm_calls is not None and budget_consumed >= self._config.max_llm_calls`. With max_llm_calls=0, the condition is `0 is not None` (True) and `budget_consumed(1) >= 0` (True immediately after pre-flight), so all entities are skipped. But _preflight() at line 371 is called unconditionally before the entity loop, burning one real API call. The user's intent of 'make no LLM calls' is violated: one call is always made.",
+      "evidence": [
+        "User runs: python -m chunking ingest --max-llm-calls 0 input/ output/",
+        "skip_wiki is False, so _preflight() is called at line 373. One real Anthropic API call is made.",
+        "Entity loop starts. budget_consumed = True(1) + 0 = 1. 1 >= 0 → all entities budget_skipped.",
+        "Net result: 1 API call billed, 0 wiki pages generated, no error or warning."
+      ]
+    },
+    {
+      "id": "ADV-008",
+      "title": "Interrupted ingest (Ctrl-C during wiki generation) leaves staging dir on disk; next run's shutil.rmtree(staging) destroys partially-written wiki pages without preserving them",
+      "severity": "medium",
+      "confidence": 0.87,
+      "pre_existing": false,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "file": "src/chunking/ingest.py",
+      "lines": "140-143",
+      "why_it_matters": "When ingest is interrupted mid-wiki-generation (e.g. by Ctrl-C or SIGTERM during an LLM call), the staging directory remains. ManifestStore checkpoints every 5 entities (line 421-424), so some wiki .md files and a partial manifest.json will be in staging. On the next run, line 141-142 unconditionally does shutil.rmtree(staging) before starting fresh. All partially-generated wiki pages—including any that succeeded and could have been reused—are discarded. The manifest checkpoint that would have enabled cache hits is also lost. This means interrupted runs must regenerate all completed entities from scratch, potentially re-billing many LLM calls.",
+      "evidence": [
+        "Corpus has 50 entities. ingest starts, pre-flight succeeds, wiki generation begins.",
+        "After 25 entities succeed (5 checkpoint saves), user presses Ctrl-C. KeyboardInterrupt propagates through wiki.generate_all, through ingest.py line 251, caught by the outer except at line 278.",
+        "except block: shutil.rmtree(staging, ignore_errors=True) at line 283 deletes the entire staging dir including 25 .md files and the checkpoint manifest.json.",
+        "Next run: line 141, staging.exists() → False (already deleted). Fresh staging created. existing_manifest = output_dir/entities/manifest.json still exists from previous successful full run (not the aborted one). Those 25 entities have source_hash from the old run, which may match or may not.",
+        "If source content changed between runs, all 25 will regenerate anyway. If unchanged, they'll hit cache. But the interrupted run's 25 newly-generated pages are permanently lost regardless."
+      ]
+    },
+    {
+      "id": "ADV-009",
+      "title": "Deleted entities/manifest.json with surviving *.md files causes all wiki pages to be regenerated and old .md files to be overwritten silently",
+      "severity": "medium",
+      "confidence": 0.80,
+      "pre_existing": false,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "file": "src/chunking/ingest.py",
+      "lines": "147-156",
+      "why_it_matters": "The ingest pipeline copies existing manifest.json and *.md files to staging at lines 150-156 as the cache source. If a user manually deletes manifest.json (e.g. to 'reset' wiki state) but leaves *.md files in place, the copy at line 151 is skipped (file not found), and no *.md files are copied either because the copy loop only runs when existing_manifest.exists(). The ManifestStore then loads an empty state. Every entity gets source_hash that doesn't match any prior entry (prior is None), _should_skip_due_to_cache returns False for all, and all entities are regenerated. The new .md files overwrite the existing ones. This is expensive but also silently discards any manual human edits made to the wiki pages.",
+      "evidence": [
+        "User runs ingest successfully. output/entities/ has manifest.json + 30 *.md files, some hand-edited.",
+        "User deletes output/entities/manifest.json to force a 'clean' wiki rebuild.",
+        "Next ingest run: line 147 checks existing_manifest.exists() → False. Lines 150-156 are skipped entirely.",
+        "staging/entities/ never gets the *.md files copied.",
+        "WikiGenerator.generate_all: manifest.load() sees empty manifest. All 30 entities have prior=None → skip returns False → all regenerate.",
+        "_record_success writes 30 fresh .md files to staging/entities/.",
+        "Atomic swap installs staging. All 30 hand-edited .md files are replaced with LLM-generated versions. No warning."
+      ]
+    },
+    {
+      "id": "ADV-010",
+      "title": "TF-IDF corpus of 1 chunk: IDF is log((1+1)/(1+1))+1 = 1.0 for every term; rebuild_vectorizer fit on vocabulary.keys() produces different IDF than original, corrupting query scores",
+      "severity": "high",
+      "confidence": 0.78,
+      "pre_existing": false,
+      "autofix_class": "manual",
+      "owner": "human",
+      "file": "src/chunking/tfidf.py",
+      "lines": "159-179",
+      "why_it_matters": "rebuild_vectorizer re-fits a TfidfVectorizer on ' '.join(vocabulary.keys()) (a single synthetic document) to initialize it, then overwrites idf_ with the stored value. The scikit-learn TfidfVectorizer internally stores _tfidf (a TfidfTransformer object) whose idf_ attribute is set. However, after the dummy fit, _tfidf.n_samples_seen_ is 1 (not the original corpus size). For sublinear_tf=True, the transform formula uses 1 + log(tf). This part is correct since idf_ is overwritten. But for the single-chunk corpus case, the original idf is all-ones (degenerate). When rebuild_vectorizer assigns vectorizer.idf_ = idf (all-ones numpy array), it sets _tfidf.idf_ correctly. However, the vocabulary fit on ' '.join(vocabulary.keys()) creates one document containing every term once, making every term appear with tf=1 in the dummy corpus. The subsequent transform_query call works correctly for TF but the IDF injection path depends on the internal sklearn attribute name idf_ being directly settable—which broke in sklearn 1.3+ where idf_ became a property backed by _tfidf. If the installed sklearn version uses the new property semantics, the assignment at line 178 silently does nothing (property setter may not exist or may raise AttributeError in strict mode), and query scores use the dummy-fit IDF instead of the real corpus IDF.",
+      "evidence": [
+        "Corpus has 1 chunk. TfidfVectorizer.fit_transform produces idf of all 1.0 values (degenerate but mathematically valid).",
+        "vocab.npz saved with these IDF values.",
+        "Query time: rebuild_vectorizer called. vectorizer.fit([' '.join(vocabulary.keys())]) produces a fresh TfidfTransformer with its own idf_ computed from the synthetic 1-document corpus.",
+        "Line 178: vectorizer.idf_ = idf. In sklearn >= 1.3, idf_ is a property on TfidfVectorizer that delegates to self._tfidf.idf_. If the property has no setter (some sklearn versions), assignment creates an instance attribute that shadows the property but does not update the internal transformer.",
+        "transform_query uses the internal transformer's idf_, not the shadowed instance attribute.",
+        "Query scores are computed using dummy-corpus IDF rather than stored IDF. For a 1-chunk corpus both are 1.0, masking the bug. For multi-chunk corpora on mismatched sklearn versions, scores are silently wrong."
+      ]
+    },
+    {
+      "id": "ADV-011",
+      "title": "Query top-k uses np.argpartition with k-1; when top_k >= len(chunks), k=len(chunks) and argpartition(-scores, k-1) partitions at last index, returning all indices unordered—no crash but spurious results",
+      "severity": "low",
+      "confidence": 0.75,
+      "pre_existing": false,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "file": "src/chunking/query.py",
+      "lines": "114-116",
+      "why_it_matters": "When top_k is set >= number of chunks (e.g. default top_k=10 on a 3-chunk corpus), k=3 at line 114. np.argpartition(-scores, k-1) partitions at index k-1=2 (last position). For a 3-element array this is valid but returns all 3 indices with the guarantee only that element at position 2 is in its sorted position. The subsequent np.argsort(-scores[top_indices]) sorts them correctly, so this is not a score-correctness bug. However, if top_k=1 and len(scores)=1, k=1, argpartition(-scores, 0) works. The actual failure case is top_k=0: k=min(0, len)=0, then top_indices=np.argpartition(-scores, -1)[:0] which is an empty slice—no crash, returns empty hits silently. User gets no results and no error when --top-k 0 is passed.",
+      "evidence": [
+        "User runs: python -m chunking query --top-k 0 output/ 'query text'",
+        "Line 114: k = min(0, len(scores)) = 0.",
+        "Line 115: np.argpartition(-scores, 0-1) = np.argpartition(-scores, -1). For a 10-element array this partitions at index -1 (last element). [:0] slices to empty.",
+        "top_sorted is empty. hits list is empty.",
+        "Output: '(no matching chunks)' printed to stderr. Exit code 0.",
+        "User believes there are no matching chunks, but the query was never actually executed."
+      ]
+    },
+    {
+      "id": "ADV-012",
+      "title": "Zero-width joiner sequences in entity names produce ManifestEntry keys with visually identical but byte-different strings, creating duplicate manifest entries for the same logical entity",
+      "severity": "medium",
+      "confidence": 0.73,
+      "pre_existing": false,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "file": "src/chunking/wiki.py",
+      "lines": "123",
+      "why_it_matters": "ManifestEntry.key() returns f'{ner_label}__{entity_name}' where entity_name comes directly from NER extraction (doc.text[start:end]), not from normalize_text output. If the original text contains an entity name with a zero-width joiner (U+200D) or variation selector, NFKC normalization (applied to the full document before chunking) will not remove ZWJ in all cases. Two occurrences of the same entity—one from text that was pre-normalized and one from text that retained a ZWJ—produce different keys in the manifest dict. The entity is treated as two separate entities, each potentially below the min_mentions threshold after splitting, causing both to be filtered out even though their combined count would pass.",
+      "evidence": [
+        "Text contains '山田\\u200d太郎' (name with ZWJ) and '山田太郎' (same name without ZWJ).",
+        "normalize_text applies NFKC but NFKC does not remove ZWJ (U+200D is not a compatibility character).",
+        "NER extracts '山田\\u200d太郎' from one chunk and '山田太郎' from another.",
+        "aggregate_entities key for first: ('山田\\u200d太郎', 'PERSON'); key for second: ('山田太郎', 'PERSON').",
+        "Each accumulates separate mention counts. If combined they'd reach min_mentions=3 but each individually only has 2 mentions.",
+        "Both are filtered out. No wiki page is generated. No warning."
+      ]
+    },
+    {
+      "id": "ADV-013",
+      "title": "NFKC folds half-width katakana to full-width, changing chunk character offsets; char_start/char_end in ChunkRecord refer to post-normalization offsets but NER char offsets within chunks are computed on chunk.text which is already normalized—this is consistent until overlap creates a chunk whose text spans a normalization boundary",
+      "severity": "medium",
+      "confidence": 0.68,
+      "pre_existing": false,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "file": "src/chunking/chunker.py",
+      "lines": "236-239",
+      "why_it_matters": "The overlap mechanism at line 237-239 computes new_text = normalized_text[new_start:end] where new_start is a sentence boundary from the *previous* chunk. This is correct for the main text. However, chunk_id is computed from new_text. If two different documents both produce a chunk with identical normalized text at the same source path, they get identical chunk_ids—silently. More critically, for the NER case: iter_entities receives chunk.text (which is normalized_text[new_start:end]), and char offsets are relative to chunk.text. When attaching entities at ner.py line 69, char_start/char_end are stored as-is (relative to chunk text). But chunks.jsonl also stores char_start/char_end as the chunk's position in the *document*. A reader who adds chunk.char_start + entity.char_start to get document-level entity position gets the right answer only if no overlap was applied. With overlap, chunk.char_start < actual start of chunk.text in the document (new_start may be earlier than the original start). The entity's document-level position is under-estimated by (original_start - new_start) bytes.",
+      "evidence": [
+        "Document has sentences S1 (offset 0-200), S2 (200-400), S3 (400-600).",
+        "Base chunk 1: S1+S2 (offset 0-400). Base chunk 2: S3 (offset 400-600).",
+        "Overlap applied to chunk 2: snap boundary found at offset 350 (mid-S2). new_start=350.",
+        "chunk2.char_start is set to 350, chunk2.text = normalized_text[350:600].",
+        "NER finds entity 'ScalarDB' at char offset 20 within chunk2.text (i.e., document offset 370).",
+        "Entity stored with char_start=20, char_end=27 (relative to chunk2.text).",
+        "chunks.jsonl records chunk2.char_start=350.",
+        "A downstream tool computes document position as 350+20=370. Correct.",
+        "BUT: original chunk2 without overlap would have char_start=400. If the reader uses chunk.char_start (400) instead of the actual new_start (350)—which is what's stored in char_start—they get 400+20=420, which is wrong by 50 chars.",
+        "The stored char_start IS the correct overlap-adjusted start (350), so the schema is internally consistent. The risk is that any reader assuming char_start is the 'natural' sentence-boundary start (400) will compute wrong offsets."
+      ]
+    },
+    {
+      "id": "ADV-014",
+      "title": "All-identical-chunk corpus causes TF-IDF matrix to be all-zeros after max_df filtering; TfidfBuilder.save writes a zero-nnz matrix; query always returns empty hits",
+      "severity": "medium",
+      "confidence": 0.81,
+      "pre_existing": false,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "file": "src/chunking/tfidf.py",
+      "lines": "57-72",
+      "why_it_matters": "If all chunks in the corpus are identical (e.g., a corpus with duplicated documents, or a tiny test corpus), every term appears in every document. With default max_df=0.95 (or any max_df < 1.0), terms that appear in >= 95% of documents are filtered. With 10+ identical chunks, every term appears in 100% of documents, exceeding max_df=0.95. TfidfVectorizer produces an empty vocabulary after filtering. The resulting matrix has shape (n_chunks, 0). vocab.npz is saved with an empty vocabulary array. On query, rebuild_vectorizer fits on an empty ' '.join([]) string. transform_query returns a zero-vector. All queries return empty hits with no diagnostic message about the empty vocabulary.",
+      "evidence": [
+        "Corpus: 10 identical .txt files (same content).",
+        "TfidfVectorizer(max_df=0.95).fit_transform(texts): every term df=10/10=1.0 > 0.95. All terms filtered. vocabulary={}, matrix shape (10,0).",
+        "tfidf.save writes matrix_shape=[10,0], vocabulary_terms=[], idf=[].",
+        "query run: TfidfBuilder.load returns vocabulary={}, idf=array([]). rebuild_vectorizer fits on ''. transform_query returns shape (1,0) zero vector.",
+        "q_vec.nnz == 0. query.py line 103: returns QueryResult with error_message 'クエリが既存語彙にヒットしませんでした' and empty hits.",
+        "User sees 'no matching chunks'. No indication that the vocabulary is empty due to corpus duplication."
+      ]
+    },
+    {
+      "id": "ADV-015",
+      "title": "Systemic failure abort raises LLMPermanentError before final manifest.save; the 5 entities already processed in the current checkpoint interval (< MANIFEST_CHECKPOINT_INTERVAL=5) lose their status updates",
+      "severity": "medium",
+      "confidence": 0.76,
+      "pre_existing": false,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "file": "src/chunking/wiki.py",
+      "lines": "419-435",
+      "why_it_matters": "The checkpoint save at line 421-424 triggers every MANIFEST_CHECKPOINT_INTERVAL=5 attempts. The systemic failure check at line 427-435 saves manifest before raising. However, the condition is checked AFTER the checkpoint check. Consider: attempts_completed goes 1, 2, 3, 4, 5 (checkpoint save), 6, 7, 8, 9, 10 (checkpoint save). If systemic failure threshold is hit at attempt 7 (5 failed out of 7 total attempted = 71% > 50%), the save at line 429 captures the state including attempt 7. This is correct. But consider the edge case where systemic failure is hit exactly at attempt 5 (5 failed out of 5+0=5 attempted, but SYSTEMIC_FAILURE_MIN_ATTEMPTS=5 so it triggers): checkpoint at line 421 fires first (attempts_completed%5==0), then systemic check at line 427 fires. Both save—double write, but functionally correct. The actual risk is a crash (not SystemicFailure) between checkpoint 5 and checkpoint 10: attempts 6-9 are lost. But this is pre-existing behavior of checkpoint-based persistence, not a new failure mode.",
+      "evidence": [
+        "50 entities to process. All start failing from entity 6 onward.",
+        "Entity 5: attempts_completed=5, checkpoint fires (save). stats: attempted=5, failed=0, succeeded=5. Systemic check: 0/5 = 0% < 50%. Continue.",
+        "Entities 6-10 all fail. At entity 10: attempts_completed=10, checkpoint fires again (save). stats: attempted=10, failed=5, succeeded=5. Systemic check: 5/10 = 50%, not > 50%. Continue.",
+        "Entity 11 fails. attempts_completed=11. 11%5 != 0, no checkpoint. Systemic check: 6/11 = 54.5% > 50%. manifest.save fires at line 429, capturing entity 11's failure. LLMPermanentError raised.",
+        "ingest.py line 252-255 catches it, sets exit_code=6, returns BEFORE _atomic_swap.",
+        "staging dir is not installed. All wiki work is lost. The manifest.save at line 429 wrote to staging/entities/manifest.json which is then deleted by line 283."
+      ]
+    }
+  ],
+  "residual_risks": [
+    {
+      "area": "NFS/SMB atomic swap",
+      "note": "os.replace (used in ManifestStore.save) is documented as atomic on POSIX local filesystems but is not atomic on NFS v3 or SMB mounts. A race between ManifestStore checkpoint write and another process reading the manifest will see a torn file on NFS. The code acknowledges this with best-effort comments but does not detect or warn when operating on a network filesystem."
+    },
+    {
+      "area": "LLM response size",
+      "note": "A 100KB query string is normalized and fed to vectorizer.transform. sklearn does not bound input string length. For a vocabulary of 100K terms, transforming a 100KB string with the Ginza tokenizer will trigger a full spaCy pipeline run on 100KB of text, potentially taking 10-30 seconds. No timeout or size guard exists in run_query_impl."
+    },
+    {
+      "area": "Emoji tokenization",
+      "note": "Emoji sequences (e.g. U+1F469 U+200D U+1F4BB, woman technologist) pass NFKC normalization unchanged. Ginza/Sudachi may tokenize them as 0 tokens (unknown surface forms) or as single tokens with POS=X (not in pos_allowlist). A chunk consisting entirely of emoji produces tokenize_for_tfidf=[]. TfidfVectorizer sees an empty token list for that chunk. With min_df=1, the row for that chunk will be all-zeros in the matrix. This is handled gracefully (degenerate row), but the lint WARNING threshold of nnz < 3 will flag it without explaining that the cause is emoji-only content."
+    }
+  ],
+  "testing_gaps": [
+    {
+      "gap": "No test exercises _atomic_swap with cross-filesystem paths (OSError on rename). The fallback copytree path is untested.",
+      "file": "tests/test_ingest.py"
+    },
+    {
+      "gap": "No test for max_llm_calls=0 or max_llm_calls=1 verifying that pre-flight counts against the budget and that all entities are budget_skipped with empty source_hash.",
+      "file": "tests/test_wiki.py"
+    },
+    {
+      "gap": "No test for LLM response containing a bare '---' line and verifying the written .md file is parseable as valid YAML-frontmatter markdown.",
+      "file": "tests/test_wiki.py"
+    },
+    {
+      "gap": "No test for two entities whose sanitized filenames collide (e.g. 'A/B' and 'A\\\\B').",
+      "file": "tests/test_ner.py"
+    },
+    {
+      "gap": "No test for rebuild_vectorizer idf_ injection verifying that transform_query uses the stored IDF values, not the dummy-fit IDF. Requires checking actual score values against a hand-computed expectation.",
+      "file": "tests/test_tfidf.py"
+    }
+  ]
+}

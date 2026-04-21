@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from chunking.cli import IDENTITY_BANNER, build_parser
+from lorebook_chunker.cli import IDENTITY_BANNER, build_parser
 
 
 def test_identity_banner_is_nonempty() -> None:

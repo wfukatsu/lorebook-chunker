@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from chunking.llm import (
+from lorebook_chunker.llm import (
     GenerateResult,
     LLMPermanentError,
     LLMPreflightError,
@@ -41,7 +41,7 @@ def _anthropic_mock_response(text: str, finish: str = "end_turn") -> SimpleNames
 def test_anthropic_client_normalizes_response(monkeypatch: pytest.MonkeyPatch) -> None:
     import anthropic
 
-    from chunking.llm.anthropic_client import AnthropicLLMClient
+    from lorebook_chunker.llm.anthropic_client import AnthropicLLMClient
 
     def fake_create(**kwargs):
         assert kwargs["model"] == "claude-haiku-4-5"
@@ -60,7 +60,7 @@ def test_anthropic_client_normalizes_response(monkeypatch: pytest.MonkeyPatch) -
 
 def test_anthropic_rate_limit_becomes_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
     import anthropic
-    from chunking.llm.anthropic_client import AnthropicLLMClient
+    from lorebook_chunker.llm.anthropic_client import AnthropicLLMClient
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
     client = AnthropicLLMClient()
@@ -79,7 +79,7 @@ def test_anthropic_rate_limit_becomes_retryable(monkeypatch: pytest.MonkeyPatch)
 
 def test_anthropic_auth_error_becomes_permanent(monkeypatch: pytest.MonkeyPatch) -> None:
     import anthropic
-    from chunking.llm.anthropic_client import AnthropicLLMClient
+    from lorebook_chunker.llm.anthropic_client import AnthropicLLMClient
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
     client = AnthropicLLMClient()
@@ -99,7 +99,7 @@ def test_anthropic_auth_error_becomes_permanent(monkeypatch: pytest.MonkeyPatch)
 # ---- Ollama client ------------------------------------------------------
 
 def test_ollama_client_uses_digest_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    import chunking.llm.ollama_client as mod
+    import lorebook_chunker.llm.ollama_client as mod
 
     class _FakeClient:
         def show(self, tag: str) -> dict:
@@ -128,7 +128,7 @@ def test_ollama_client_uses_digest_when_available(monkeypatch: pytest.MonkeyPatc
 
 def test_ollama_client_passes_think_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     """Qwen3 系は think=False を渡さないと response が空になる (F-016 拡張)."""
-    import chunking.llm.ollama_client as mod
+    import lorebook_chunker.llm.ollama_client as mod
 
     captured: dict = {}
 
@@ -153,7 +153,7 @@ def test_ollama_client_falls_back_when_think_kwarg_unsupported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """ollama-python <0.4 では think kwarg 未対応 → TypeError fallback."""
-    import chunking.llm.ollama_client as mod
+    import lorebook_chunker.llm.ollama_client as mod
 
     call_log: list[dict] = []
 
@@ -176,7 +176,7 @@ def test_ollama_client_falls_back_when_think_kwarg_unsupported(
 
 
 def test_ollama_client_falls_back_to_modelfile_hash(monkeypatch: pytest.MonkeyPatch) -> None:
-    import chunking.llm.ollama_client as mod
+    import lorebook_chunker.llm.ollama_client as mod
 
     class _FakeClient:
         def show(self, tag: str) -> dict:
@@ -192,7 +192,7 @@ def test_ollama_client_falls_back_to_modelfile_hash(monkeypatch: pytest.MonkeyPa
 
 
 def test_ollama_client_unknown_digest_marks_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
-    import chunking.llm.ollama_client as mod
+    import lorebook_chunker.llm.ollama_client as mod
 
     class _FakeClient:
         def show(self, tag: str) -> dict:
@@ -207,7 +207,7 @@ def test_ollama_client_unknown_digest_marks_unknown(monkeypatch: pytest.MonkeyPa
 
 
 def test_ollama_generate_connection_error_is_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
-    import chunking.llm.ollama_client as mod
+    import lorebook_chunker.llm.ollama_client as mod
 
     class _FakeClient:
         def show(self, tag: str):
@@ -223,7 +223,7 @@ def test_ollama_generate_connection_error_is_retryable(monkeypatch: pytest.Monke
 
 
 def test_ollama_model_not_found_is_permanent(monkeypatch: pytest.MonkeyPatch) -> None:
-    import chunking.llm.ollama_client as mod
+    import lorebook_chunker.llm.ollama_client as mod
 
     class _FakeClient:
         def show(self, tag: str):

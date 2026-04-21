@@ -12,10 +12,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, NoReturn, Protocol
 
-from chunking.chunker import Chunker
-from chunking.cli import IDENTITY_BANNER
-from chunking.llm import LLMClient, LLMPermanentError, get_client
-from chunking.ner import (
+from lorebook_chunker.chunker import Chunker
+from lorebook_chunker.cli import IDENTITY_BANNER
+from lorebook_chunker.llm import LLMClient, LLMPermanentError, get_client
+from lorebook_chunker.ner import (
     AggregationStats,
     DEFAULT_MIN_CHUNKS,
     DEFAULT_MIN_MENTIONS,
@@ -25,10 +25,10 @@ from chunking.ner import (
     extract_entities_per_chunk,
     sanitize_entity_filename,
 )
-from chunking.normalize import normalize_text
-from chunking.schema import ChunkRecord
-from chunking.tfidf import TfidfBuilder
-from chunking.wiki import (
+from lorebook_chunker.normalize import normalize_text
+from lorebook_chunker.schema import ChunkRecord
+from lorebook_chunker.tfidf import TfidfBuilder
+from lorebook_chunker.wiki import (
     WikiGenerator,
     WikiGeneratorConfig,
     WikiStats,
@@ -58,7 +58,7 @@ class IngestAnalyzer(Protocol):
 
 def default_analyzer_factory(existing_path: Path | None) -> IngestAnalyzer:
     """既存 analyzer.json があれば load、無ければ新規生成."""
-    from chunking.analyzer import JapaneseAnalyzer
+    from lorebook_chunker.analyzer import JapaneseAnalyzer
 
     if existing_path is not None and existing_path.exists():
         return JapaneseAnalyzer.load_and_verify(existing_path)

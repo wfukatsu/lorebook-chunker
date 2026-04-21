@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from chunking.ingest import IngestConfig, IngestRunner
-from chunking.llm import GenerateResult
-from chunking.query import QueryResult, run_query, run_query_impl
+from lorebook_chunker.ingest import IngestConfig, IngestRunner
+from lorebook_chunker.llm import GenerateResult
+from lorebook_chunker.query import QueryResult, run_query, run_query_impl
 from tests.test_ingest import _ScriptedLLM, _StubAnalyzer
 
 
@@ -129,9 +129,9 @@ def test_run_query_cli_wrapper_ok(
         top_k=3,
         command="query",
     )
-    import chunking.query as mod
+    import lorebook_chunker.query as mod
     monkeypatch.setattr(
-        "chunking.ingest.default_analyzer_factory", lambda path: _StubAnalyzer()
+        "lorebook_chunker.ingest.default_analyzer_factory", lambda path: _StubAnalyzer()
     )
     exit_code = run_query(args)
     assert exit_code == 0

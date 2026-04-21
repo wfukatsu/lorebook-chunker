@@ -15,8 +15,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from chunking.normalize import NORMALIZATION_SPEC, normalize_text
-from chunking.schema import (
+from lorebook_chunker.normalize import NORMALIZATION_SPEC, normalize_text
+from lorebook_chunker.schema import (
     AnalyzerConfig,
     AnalyzerNEUnavailableError,
     AnalyzerVersionMismatchError,

@@ -14,9 +14,9 @@ from typing import Any
 import numpy as np
 from scipy.sparse import csr_matrix
 
-from chunking._io import load_chunks
-from chunking.schema import ChunkFileCorruptError
-from chunking.tfidf import TfidfBuilder
+from lorebook_chunker._io import load_chunks
+from lorebook_chunker.schema import ChunkFileCorruptError
+from lorebook_chunker.tfidf import TfidfBuilder
 
 logger = logging.getLogger(__name__)
 

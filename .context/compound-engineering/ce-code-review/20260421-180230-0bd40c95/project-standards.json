@@ -1,0 +1,92 @@
+{
+  "reviewer": "project-standards",
+  "findings": [
+    {
+      "id": "PS-001",
+      "severity": "P1",
+      "category": "plan-invariant",
+      "title": "--skip-wiki still writes index.md unconditionally",
+      "file": "src/chunking/ingest.py",
+      "line": 258,
+      "pre_existing": false,
+      "confidence": 0.95,
+      "rule_source": "docs/plans/2026-04-21-001-feat-japanese-rag-chunking-plan.md, Unit 8 Approach: '--skip-wiki 指定時は staging directory に entities/ と index.md は作成しない (ユーザが実行後に出力を ls しても entities/ が生えず、wiki 未生成を直感的に理解できる)'",
+      "violation": "src/chunking/ingest.py line 258 calls `_write_index_md(staging / 'index.md', staging / 'entities' / 'manifest.json')` unconditionally, outside the `if not self.cfg.skip_wiki:` guard (lines 233-255). When --skip-wiki is set, index.md is still created, violating the plan invariant.",
+      "why_it_matters": "The plan's Unit 8 explicitly requires that no entities/ or index.md appear in the output when --skip-wiki is used, so that users can visually confirm wiki generation was skipped. The current code creates index.md regardless, producing an output that contradicts the documented contract and the test scenario ('--skip-wiki で entities/, index.md が作成されず').",
+      "evidence": [
+        {
+          "file": "src/chunking/ingest.py",
+          "line_range": "233-258",
+          "snippet": "if not self.cfg.skip_wiki:\n    ...\n# 8. index.md\n_write_index_md(staging / 'index.md', staging / 'entities' / 'manifest.json')"
+        },
+        {
+          "file": "docs/plans/2026-04-21-001-feat-japanese-rag-chunking-plan.md",
+          "section": "Unit 8 Approach",
+          "quote": "--skip-wiki 指定時は staging directory に entities/ と index.md は作成しない"
+        }
+      ]
+    },
+    {
+      "id": "PS-002",
+      "severity": "P1",
+      "category": "plan-invariant",
+      "title": "samples/*.txt files required by Unit 11 are absent",
+      "file": "samples/",
+      "line": null,
+      "pre_existing": false,
+      "confidence": 0.95,
+      "rule_source": "docs/plans/2026-04-21-001-feat-japanese-rag-chunking-plan.md, Unit 11 Files: 'Create: samples/01_news.txt, 02_tech.txt, 03_interview.txt, 04_travel.txt, 05_biography.txt, 06_fiction.txt'",
+      "violation": "The samples/ directory contains only README.md and expected.yaml. The six required .txt files (01_news.txt through 06_fiction.txt) are absent. The review context file list confirms they are not in scope either.",
+      "why_it_matters": "Unit 11 sample files are a plan-required deliverable that Unit 12 smoke tests depend on. Without them the smoke tests in test_smoke.py and test_cli_smoke.py cannot exercise the full ingest → query → lint pipeline on the intended Japanese corpus, and the R23/R24/R25 acceptance criteria cannot be evaluated.",
+      "evidence": [
+        {
+          "file": "docs/plans/2026-04-21-001-feat-japanese-rag-chunking-plan.md",
+          "section": "Unit 11 Files",
+          "quote": "Create: samples/01_news.txt, samples/02_tech.txt, samples/03_interview.txt, samples/04_travel.txt, samples/05_biography.txt, samples/06_fiction.txt"
+        },
+        {
+          "note": "ls samples/ shows only: expected.yaml  README.md"
+        }
+      ]
+    },
+    {
+      "id": "PS-003",
+      "severity": "P2",
+      "category": "cross-platform-portability",
+      "title": "Chunker._posix_relative uses PurePosixPath for both sides, breaking Windows paths",
+      "file": "src/chunking/chunker.py",
+      "line": 267,
+      "pre_existing": false,
+      "confidence": 0.82,
+      "rule_source": "docs/plans/2026-04-21-001-feat-japanese-rag-chunking-plan.md, Key Technical Decisions (chunk_id 正規形式): 'posix_relative_source = Path(source).relative_to(input_dir).as_posix() で OS 非依存のパスに変換'",
+      "violation": "src/chunking/chunker.py lines 267-268 implement `_posix_relative` as `str(PurePosixPath(source).relative_to(PurePosixPath(input_dir)))`. On Windows, file paths use backslashes (e.g. 'samples\\01_news.txt'), and PurePosixPath treats backslash as part of the filename rather than a separator, so `relative_to` will raise ValueError and the fallback returns the full PurePosixPath(source) string. The plan requires `Path(source).relative_to(input_dir).as_posix()` to handle native OS path separators before converting to POSIX.",
+      "why_it_matters": "The plan explicitly prescribes `Path(source).relative_to(input_dir).as_posix()` to ensure chunk_id stability across OS. If Chunker is run on Windows, every source path would fall through to the exception branch and produce an incorrect POSIX path, causing chunk_id mismatches across re-ingests and breaking the atomic regeneration invariant (R8b).",
+      "evidence": [
+        {
+          "file": "src/chunking/chunker.py",
+          "line_range": "263-269",
+          "snippet": "def _posix_relative(source: str, input_dir: str | None) -> str:\n    if input_dir is None:\n        return source\n    try:\n        return str(PurePosixPath(source).relative_to(PurePosixPath(input_dir)))\n    except ValueError:\n        return str(PurePosixPath(source))"
+        },
+        {
+          "file": "docs/plans/2026-04-21-001-feat-japanese-rag-chunking-plan.md",
+          "section": "Key Technical Decisions — chunk_id 正規形式",
+          "quote": "posix_relative_source = Path(source).relative_to(input_dir).as_posix() で OS 非依存のパスに変換"
+        }
+      ]
+    }
+  ],
+  "residual_risks": [
+    {
+      "id": "RR-PS-001",
+      "description": "normalize_text does not strip leading/trailing whitespace from the whole string. Plan Unit 2 test scenario expects normalize_text('Ｃａｆｅ　\\r\\n  \\r\\n テスト ') to return 'Cafe\\nテスト', but current implementation preserves the blank line between 'Cafe' and 'テスト', yielding 'Cafe\\n\\nテスト'. This affects how source_hash is computed and may affect chunk boundary detection. Deferred to correctness reviewer.",
+      "confidence": 0.70
+    }
+  ],
+  "testing_gaps": [
+    {
+      "id": "TG-PS-001",
+      "description": "No test verifies that --skip-wiki suppresses both entities/ directory creation and index.md creation. test_ingest.py tests --skip-wiki path but does not assert absence of index.md in the output directory.",
+      "confidence": 0.80
+    }
+  ]
+}

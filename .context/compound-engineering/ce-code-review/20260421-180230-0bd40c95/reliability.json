@@ -1,0 +1,132 @@
+{
+  "reviewer": "reliability",
+  "findings": [
+    {
+      "id": "REL-001",
+      "severity": "P1",
+      "confidence": 0.90,
+      "pre_existing": false,
+      "title": "Cross-filesystem atomic swap does not restore backup on copytree failure",
+      "file": "src/chunking/ingest.py",
+      "lines": "321-328",
+      "category": "partial_failure",
+      "summary": "_atomic_swap renames the live output_dir to a .backup before calling staging.rename(target). If rename raises OSError (cross-filesystem), it falls back to shutil.copytree(staging, target). If copytree itself fails mid-way (disk full, SIGKILL, etc.), the finally path is not reached: backup is not restored, target may not exist or be partially populated, and staging is not cleaned up. The user is left with no valid output_dir.",
+      "why_it_matters": "This is the sole durability guarantee in the pipeline. A failed copytree during the fallback path destroys the previous good output without substituting a valid new one, causing data loss on reruns against non-empty output directories across filesystems.",
+      "evidence": [
+        "ingest.py:321-326: `except OSError:` block calls `shutil.copytree(staging, target)` and `shutil.rmtree(staging)` with no try/except and no restoration of `backup` on failure",
+        "ingest.py:327-328: backup cleanup only runs if we reach that line — unreachable if copytree raises"
+      ],
+      "recommendation": "Wrap the copytree+rmtree in a try/except that attempts to rename backup back to target on failure. Or document that same-filesystem deployment is required (and enforce via a preflight path check)."
+    },
+    {
+      "id": "REL-002",
+      "severity": "P1",
+      "confidence": 0.85,
+      "pre_existing": false,
+      "title": "Ollama client has no timeout — hangs indefinitely on slow/stuck local daemon",
+      "file": "src/chunking/llm/ollama_client.py",
+      "lines": "54-67",
+      "category": "missing_timeout",
+      "summary": "OllamaLLMClient.generate calls self._client.generate(...) with no timeout parameter. The ollama Python SDK does not impose a default request timeout. If the Ollama daemon is slow or hung, the call blocks indefinitely, consuming the ingest process for every retry attempt across all entities.",
+      "why_it_matters": "A single hung Ollama request during wiki generation will stall the entire ingest pipeline with no way to recover short of SIGKILL. Combined with DEFAULT_RETRY_ATTEMPTS=3 and no upper bound on entities, the total block time is unbounded.",
+      "evidence": [
+        "ollama_client.py:33-35: `ollama.Client(host=host)` constructed without timeout argument",
+        "ollama_client.py:55-60: `self._client.generate(model=..., prompt=..., options=..., stream=False)` — no timeout kwarg"
+      ],
+      "recommendation": "Pass a timeout (e.g. 60s) to `ollama.Client` constructor and/or to the generate call. Map timeout exceptions to `LLMRetryableError` so the existing retry+backoff logic handles them."
+    },
+    {
+      "id": "REL-003",
+      "severity": "P2",
+      "confidence": 0.88,
+      "pre_existing": false,
+      "title": "query.py _load_chunks: per-line json.loads has no error handling — corrupt line crashes query",
+      "file": "src/chunking/query.py",
+      "lines": "132-137",
+      "category": "missing_error_handling",
+      "summary": "_load_chunks iterates chunks.jsonl and calls json.loads(line) with no try/except. A single malformed JSON line (truncated write, manual edit, encoding issue) raises JSONDecodeError uncaught by run_query_impl, propagating as an unhandled exception through the query CLI.",
+      "why_it_matters": "chunks.jsonl is written incrementally in ingest (line 226-229 of ingest.py). An interrupted ingest could produce a partial last line. Subsequent query runs against that output will crash rather than returning a graceful error.",
+      "evidence": [
+        "query.py:137: `yield json.loads(line)` — no surrounding try/except",
+        "query.py:79: `chunks = list(_load_chunks(chunks_path))` — exception propagates to caller with no catch at this level"
+      ],
+      "recommendation": "Wrap json.loads in a try/except JSONDecodeError; either skip and warn on bad lines, or return a QueryResult with exit_code=3 and a descriptive error_message."
+    },
+    {
+      "id": "REL-004",
+      "severity": "P2",
+      "confidence": 0.82,
+      "pre_existing": false,
+      "title": "LLMPermanentError mid-run (e.g. post-preflight auth revocation) is silently demoted to a per-entity failure",
+      "file": "src/chunking/wiki.py",
+      "lines": "519-521",
+      "category": "error_swallowing",
+      "summary": "_generate_for_entity catches LLMPermanentError and returns None, recording the entity as 'failed'. This means a permanent error that occurs after preflight (such as key revocation, model deprecation, or a 403 mid-run) causes every subsequent entity to fail silently until the systemic failure detector fires at SYSTEMIC_FAILURE_MIN_ATTEMPTS=5 with >50% failure ratio. The caller gets no immediate signal that the error is permanent.",
+      "why_it_matters": "5+ LLM calls are wasted before the systemic abort triggers. More importantly, with a small entity list (fewer than 5 total), the systemic threshold is never reached and all entities silently record as 'failed' with reason='retries exhausted', making diagnosis harder.",
+      "evidence": [
+        "wiki.py:519-521: `except LLMPermanentError as e: logger.warning(...); return None`",
+        "wiki.py:618-621: systemic abort requires `attempted >= SYSTEMIC_FAILURE_MIN_ATTEMPTS` (5) — never fires for <5 entity corpora"
+      ],
+      "recommendation": "Re-raise LLMPermanentError from _generate_for_entity (or a dedicated subclass) so generate_all can abort immediately on the first permanent error rather than absorbing it as a per-entity failure."
+    },
+    {
+      "id": "REL-005",
+      "severity": "P3",
+      "confidence": 0.72,
+      "pre_existing": false,
+      "title": "analyzer.save writes without fsync — torn write possible on crash during ingest staging",
+      "file": "src/chunking/analyzer.py",
+      "lines": "217-222",
+      "category": "missing_durability",
+      "summary": "JapaneseAnalyzer.save opens the file with open('w') and calls json.dump, but does not call f.flush() + os.fsync() before close. In contrast, ManifestStore.save and _append_log_md both explicitly fsync. A process crash between OS buffer write and physical write would leave analyzer.json partially written, which compute_analyzer_json_hash would silently hash, producing a different hash than the fully-written version.",
+      "why_it_matters": "A torn analyzer.json in staging would not be caught until a future ingest tries to load_and_verify, at which point strict_match would differ. The output would be in an inconsistent state (chunks.jsonl was written with the full analyzer, but analyzer.json is truncated).",
+      "evidence": [
+        "analyzer.py:221-222: `json.dump(config.to_dict(), f, ...)` — no flush/fsync before file close",
+        "Contrast: wiki.py:224-225 in ManifestStore.save: `f.flush(); os.fsync(f.fileno())`"
+      ],
+      "recommendation": "Add `f.flush(); os.fsync(f.fileno())` before the context manager exits in JapaneseAnalyzer.save, consistent with the rest of the codebase."
+    },
+    {
+      "id": "REL-006",
+      "severity": "P3",
+      "confidence": 0.65,
+      "pre_existing": false,
+      "title": "IngestRunner.run: early-exit paths before _atomic_swap do not clean up staging dir",
+      "file": "src/chunking/ingest.py",
+      "lines": "195-255",
+      "category": "resource_leak",
+      "summary": "Several early-return paths inside the try block (exit_code 5 at line 197, and exit_code 6 at line 253-255) return before reaching _atomic_swap without cleaning up the staging directory. The outer except at line 278 does clean up on unhandled exceptions, but structured early returns bypass it.",
+      "why_it_matters": "A .staging directory left on disk from a failed run causes the next ingest run to call shutil.rmtree(staging) at line 142, which is correct. However, the orphaned staging dir may confuse operators inspecting the output directory and could consume significant disk space (it holds a full copy of vocab.npz, chunks.jsonl, etc.).",
+      "evidence": [
+        "ingest.py:195-198: `result.exit_code = 5; result.errors.append(...); return result` — no staging cleanup",
+        "ingest.py:253-255: `result.exit_code = 6; result.errors.append(...); return result` — no staging cleanup",
+        "ingest.py:282-283: outer except does `shutil.rmtree(staging, ignore_errors=True)` — only reached for unhandled exceptions"
+      ],
+      "recommendation": "Move the staging cleanup into a try/finally block, or use contextlib.ExitStack to register `shutil.rmtree(staging, ignore_errors=True)` as a cleanup action at staging creation time, ensuring all exit paths clean up."
+    }
+  ],
+  "residual_risks": [
+    {
+      "id": "RRES-001",
+      "note": "Ollama _resolve_model_id swallows all exceptions from ollama.show and returns '{tag}@unknown'. If the model tag is wrong, model_id will be stable-looking but inaccurate, causing source_hash to be computed with a misleading model identifier and potentially skipping cache invalidation when the actual model changes."
+    },
+    {
+      "id": "RRES-002",
+      "note": "ManifestStore.save uses tempfile.mkstemp in the same directory as manifest.json (same-fs guarantee for os.replace). This is correct on a single filesystem but will fail with OSError if entities_dir is a different filesystem from its parent — a rare but possible deployment configuration."
+    }
+  ],
+  "testing_gaps": [
+    {
+      "id": "RTGAP-001",
+      "note": "No test covers _atomic_swap when staging.rename raises OSError and copytree subsequently raises (cross-filesystem double-failure path). The backup restoration gap in REL-001 is untested."
+    },
+    {
+      "id": "RTGAP-002",
+      "note": "No test exercises _load_chunks with a malformed JSON line to verify graceful error handling (REL-003)."
+    },
+    {
+      "id": "RTGAP-003",
+      "note": "No test covers LLMPermanentError raised during _generate_for_entity mid-run (after preflight) with a corpus smaller than SYSTEMIC_FAILURE_MIN_ATTEMPTS=5 entities, where the systemic abort never fires."
+    }
+  ]
+}

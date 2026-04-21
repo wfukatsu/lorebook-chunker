@@ -14,10 +14,10 @@ from typing import Any
 import pytest
 import yaml
 
-from chunking.ingest import IngestConfig, IngestRunner, run_ingest
-from chunking.lint import FATAL, run_lint_impl
-from chunking.query import run_query_impl
-from chunking.schema import EntityMention
+from lorebook_chunker.ingest import IngestConfig, IngestRunner, run_ingest
+from lorebook_chunker.lint import FATAL, run_lint_impl
+from lorebook_chunker.query import run_query_impl
+from lorebook_chunker.schema import EntityMention
 from tests.test_ingest import _ScriptedLLM, _StubAnalyzer
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -63,7 +63,7 @@ def _ingest_fixture(tmp_path: Path, *, skip_wiki: bool = True) -> Path:
             "スカラー商事": [EntityMention("スカラー商事", "ORG", 0, 6)],
         }
     )
-    from chunking.llm import GenerateResult
+    from lorebook_chunker.llm import GenerateResult
 
     def _ok() -> GenerateResult:
         return GenerateResult(text="要約", input_tokens=5, output_tokens=10, model_id="mock@v1", finish_reason="end_turn")
@@ -201,7 +201,7 @@ def test_ingest_preserves_existing_output_on_failure(tmp_path: Path, monkeypatch
     assert chunks_before
 
     # 2 回目: chunker 呼び出し時に例外を投げる
-    import chunking.ingest as mod
+    import lorebook_chunker.ingest as mod
 
     original_chunker = mod.Chunker
     call_count = {"n": 0}
@@ -253,7 +253,7 @@ def test_real_sample_char_counts_within_tolerance() -> None:
 def test_real_samples_end_to_end_query(tmp_path: Path) -> None:
     """実サンプルで ingest→query. Ginza 必須だが real samples が無ければ skip."""
     # Ginza 必須のため、JapaneseAnalyzer を使って実行する想定
-    from chunking.ingest import default_analyzer_factory
+    from lorebook_chunker.ingest import default_analyzer_factory
     out = tmp_path / "out"
     cfg = IngestConfig(
         input_dir=REAL_SAMPLES,
@@ -282,7 +282,7 @@ def test_real_samples_end_to_end_query(tmp_path: Path) -> None:
 def test_anthropic_live_ingest_completes(tmp_path: Path) -> None:
     """実 Anthropic API での smoke. ANTHROPIC_API_KEY 必須."""
     assert os.getenv("ANTHROPIC_API_KEY"), "ANTHROPIC_API_KEY required"
-    from chunking.ingest import default_analyzer_factory
+    from lorebook_chunker.ingest import default_analyzer_factory
 
     out = tmp_path / "out"
     cfg = IngestConfig(
@@ -299,7 +299,7 @@ def test_anthropic_live_ingest_completes(tmp_path: Path) -> None:
 @pytest.mark.skipif(os.getenv("RUN_OLLAMA") != "1", reason="RUN_OLLAMA=1 required for live Ollama test")
 def test_ollama_live_ingest_completes(tmp_path: Path) -> None:
     """実 Ollama ローカル LLM での smoke."""
-    from chunking.ingest import default_analyzer_factory
+    from lorebook_chunker.ingest import default_analyzer_factory
 
     out = tmp_path / "out"
     cfg = IngestConfig(

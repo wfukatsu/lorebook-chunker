@@ -1,0 +1,164 @@
+{
+  "reviewer": "maintainability",
+  "findings": [
+    {
+      "id": "M-01",
+      "title": "Dead CLI flag: --config is registered but never consumed",
+      "severity": "warning",
+      "confidence": 0.97,
+      "pre_existing": false,
+      "file": "src/chunking/cli.py",
+      "line_range": [32, 32],
+      "category": "dead_code",
+      "why_it_matters": "The `--config PATH` argument is added to the `ingest` subparser but `args.config` is never read anywhere in ingest.py or cli.py. A future developer will assume it does something (the help text says 'optional'), spend time reverse-engineering the expected format, or write code that silently ignores it. Either wire it up or remove it.",
+      "evidence": [
+        "cli.py:32  p.add_argument('--config', default=None, help='設定ファイル (optional)')",
+        "ingest.py:424-433  run_ingest() never reads args.config; IngestConfig has no config_file field",
+        "No other file in src/ references args.config or IngestConfig.config_file"
+      ],
+      "recommendation": "Remove the argument registration until the feature is implemented, or add a TODO comment referencing the tracking issue so no developer confuses absence with a bug."
+    },
+    {
+      "id": "M-02",
+      "title": "Duplicate _load_chunks function in query.py and lint.py",
+      "severity": "warning",
+      "confidence": 0.95,
+      "pre_existing": false,
+      "file": "src/chunking/query.py",
+      "line_range": [132, 138],
+      "category": "dead_code",
+      "why_it_matters": "query.py:132-138 and lint.py:208-214 are byte-for-byte identical private helpers. When the chunks.jsonl schema evolves (e.g. adding a field that needs validation on load), a developer will fix one copy and miss the other. This is the classic bug-multiplier pattern for copy-pasted helpers.",
+      "evidence": [
+        "query.py:132-138  def _load_chunks(path: Path) -> Iterable[dict[str, Any]]: opens, iterates stripped non-empty lines, json.loads each",
+        "lint.py:208-214   identical implementation with identical signature"
+      ],
+      "recommendation": "Extract to a shared location, e.g. a new `src/chunking/_io.py` module with a single `load_chunks_jsonl(path: Path) -> Iterable[dict[str, Any]]` function. Both callers already use it identically."
+    },
+    {
+      "id": "M-03",
+      "title": "EntityStatus type alias adds no type safety over bare str",
+      "severity": "info",
+      "confidence": 0.87,
+      "pre_existing": false,
+      "file": "src/chunking/wiki.py",
+      "line_range": [59, 59],
+      "category": "premature_abstraction",
+      "why_it_matters": "Line 59 declares `EntityStatus = str  # \"success\" | \"failed\" | \"budget_skipped\"`. Because it is just `str`, mypy/pyright treats it identically to `str`; no checker will catch an invalid literal like `\"Budget_Skipped\"` or `\"pending\"`. The alias gives the appearance of a constrained type without providing any constraint. A `Literal[\"success\", \"failed\", \"budget_skipped\"]` would actually enforce the contract; the current alias only misleads.",
+      "evidence": [
+        "wiki.py:59  EntityStatus = str  # comment-only constraint",
+        "wiki.py:114  status: EntityStatus  — field declaration looks typed but is unchecked",
+        "wiki.py:483-490  _should_skip_due_to_cache compares prior.status against string literals — no static check would catch a typo here"
+      ],
+      "recommendation": "Replace with `EntityStatus = Literal[\"success\", \"failed\", \"budget_skipped\"]` (requires `from typing import Literal`), or if Literal is too constraining for now, drop the alias and document the valid values in the dataclass docstring only."
+    },
+    {
+      "id": "M-04",
+      "title": "QueryAnalyzer Protocol in query.py is defined but never referenced",
+      "severity": "warning",
+      "confidence": 0.93,
+      "pre_existing": false,
+      "file": "src/chunking/query.py",
+      "line_range": [17, 18],
+      "category": "dead_code",
+      "why_it_matters": "query.py defines `class QueryAnalyzer(Protocol)` with one method `tokenize_for_tfidf`. Nothing in query.py, the tests, or any other module references this Protocol as a type annotation. The function `run_query_impl` uses `analyzer_factory=None` with no type annotation that references `QueryAnalyzer`. The Protocol is defined for an abstraction that has no consumer, adding confusion about whether `run_query_impl` is supposed to accept any `QueryAnalyzer`-conformant object or specifically only the `default_analyzer_factory` result.",
+      "evidence": [
+        "query.py:17-18  class QueryAnalyzer(Protocol): defined",
+        "grep across all 42 source+test files: zero references to QueryAnalyzer other than its definition"
+      ],
+      "recommendation": "Either annotate `analyzer_factory` in `run_query_impl` using `QueryAnalyzer` to give the Protocol a purpose, or delete the Protocol. If the intent is to document the shape expected of the analyzer, a type alias or comment is lighter weight."
+    },
+    {
+      "id": "M-05",
+      "title": "AnalyzerFactory and LLMClientFactory type aliases are module-private but named as exports",
+      "severity": "info",
+      "confidence": 0.75,
+      "pre_existing": false,
+      "file": "src/chunking/ingest.py",
+      "line_range": [57, 58],
+      "category": "unnecessary_indirection",
+      "why_it_matters": "Lines 57-58 define `AnalyzerFactory = Callable[[Path | None], IngestAnalyzer]` and `LLMClientFactory = Callable[[str, dict[str, Any] | None], LLMClient]`. Both aliases are used only once each (as parameter type annotations in `IngestRunner.__init__`). They are not exported, not referenced by tests or other modules. The aliases add a layer of indirection—a developer reading `IngestRunner.__init__` must scroll up to understand what `AnalyzerFactory` means rather than reading the type inline.",
+      "evidence": [
+        "ingest.py:57-58  alias definitions",
+        "ingest.py:110-111  sole usage as parameter annotations in IngestRunner.__init__",
+        "grep across all files: zero other references outside ingest.py"
+      ],
+      "recommendation": "Inline the `Callable` types directly in `IngestRunner.__init__`'s signature. If the types grow complex in the future, reintroduce aliases at that point."
+    },
+    {
+      "id": "M-06",
+      "title": "IngestAnalyzer Protocol duplicates SupportsIterEntities without cross-referencing",
+      "severity": "warning",
+      "confidence": 0.82,
+      "pre_existing": false,
+      "file": "src/chunking/ingest.py",
+      "line_range": [42, 55],
+      "category": "unnecessary_indirection",
+      "why_it_matters": "`IngestAnalyzer` (ingest.py:42-55) and `SupportsIterEntities` (ner.py:33-34) both describe protocols that expose `iter_entities`. `IngestAnalyzer` is a strict superset (it adds `iter_sentences`, `tokenize_for_tfidf`, `save`). Both exist without any cross-reference or inheritance relationship. Future developers implementing a new analyzer must discover both protocols independently; a stub that satisfies one may silently not satisfy the other. The proliferation of parallel protocol definitions for the same concrete type (`JapaneseAnalyzer`) increases the surface area a new implementor must cover.",
+      "evidence": [
+        "ingest.py:42-55  IngestAnalyzer Protocol with 4 methods including iter_entities",
+        "ner.py:33-34  SupportsIterEntities Protocol with 1 method iter_entities",
+        "Both protocols are structurally compatible but independently defined with no comment linking them"
+      ],
+      "recommendation": "Have `IngestAnalyzer` extend `SupportsIterEntities`, or consolidate into a single `JapaneseAnalyzerProtocol` in `schema.py` (or a new `protocols.py`) that both `ner.py` and `ingest.py` import. This makes the single source of truth explicit."
+    },
+    {
+      "id": "M-07",
+      "title": "Dual by_id dict construction for the same chunks list inside WikiGenerator",
+      "severity": "info",
+      "confidence": 0.80,
+      "pre_existing": false,
+      "file": "src/chunking/wiki.py",
+      "line_range": [294, 313],
+      "category": "unnecessary_indirection",
+      "why_it_matters": "`_build_chunk_snippets` (line 294) builds `by_id = {c.chunk_id: c for c in chunks}` and `_build_entity_prompt` (line 530) builds an identical `by_id = {c.chunk_id: c for c in self._chunks}` dict. Both are called per entity, so the same O(N) dict construction is repeated twice per entity. More importantly, when the chunk list is large this is an invisible per-entity overhead that a developer optimising for throughput will have to hunt down across two separate methods. The `chunks` list held in `self._chunks` is stable for the lifetime of a `WikiGenerator` instance; the lookup dict should be built once.",
+      "evidence": [
+        "wiki.py:298  by_id = {c.chunk_id: c for c in chunks}  inside _build_chunk_snippets",
+        "wiki.py:530  by_id = {c.chunk_id: c for c in self._chunks}  inside _build_entity_prompt"
+      ],
+      "recommendation": "Build `self._chunks_by_id: dict[str, ChunkRecord] = {c.chunk_id: c for c in chunks}` once in `WikiGenerator.__init__` and pass it to both helpers (or access it via `self`)."
+    },
+    {
+      "id": "M-08",
+      "title": "_ginza_model_version catches all exceptions and returns 'unknown', masking analyzer protocol violations",
+      "severity": "info",
+      "confidence": 0.72,
+      "pre_existing": false,
+      "file": "src/chunking/ingest.py",
+      "line_range": [296, 303],
+      "category": "naming_obscures_intent",
+      "why_it_matters": "`_ginza_model_version(analyzer)` silently returns `'unknown'` for any exception. This means that if `analyzer.build_config()` raises because the analyzer's interface changed, or the key names shifted, the caller (which uses this value for the manifest `ginza_model` field and for `source_hash` computation) will silently record `'unknown'` instead of failing loudly. A cache miss will never be triggered for a real model change if `_ginza_model_version` consistently returns the same fallback. The broad exception catch also hides bugs during testing because a stub that doesn't implement `build_config()` will never surface an error.",
+      "evidence": [
+        "ingest.py:296-303  broad except Exception: return 'unknown'",
+        "ingest.py:247  ginza_model_version=_ginza_model_version(analyzer) passed to WikiGenerator which uses it in source_hash"
+      ],
+      "recommendation": "Let the function raise on unexpected errors. Add a narrower guard only for the specific case where `build_config` is absent (i.e. catch `AttributeError` only), so unexpected failures surface instead of producing a silent cache-invalidation bug."
+    }
+  ],
+  "residual_risks": [
+    {
+      "area": "EntityStatus str alias",
+      "risk": "Status values 'success', 'failed', 'budget_skipped' are used in literal string comparisons in at least 4 places (wiki.py:483-490, ingest.py logic, manifest serialization). A typo introduced during a rename will not be caught by any static checker and would silently affect cache decisions.",
+      "mitigation_available": "Use Literal type or an Enum; covered by finding M-03."
+    },
+    {
+      "area": "_load_chunks duplication",
+      "risk": "If chunks.jsonl gains a required validation step (e.g., schema version check), patching only one copy will leave the other silently broken until the corresponding CLI path is exercised under test.",
+      "mitigation_available": "Deduplication into shared helper; covered by finding M-02."
+    },
+    {
+      "area": "wiki.py size",
+      "risk": "At 621 LOC wiki.py handles hash computation, manifest I/O, wiki rendering, entity prompt construction, retry loops, and systemic failure detection. Each concern is well-separated into methods, but all live in one file. Future additions (e.g., a different wiki template or a second manifest backend) will push it past a manageable size. No immediate action needed, but the file should be watched as the next natural split point.",
+      "mitigation_available": "The current division into ManifestStore / WikiGenerator / _render_wiki_page is adequate for v1. Flag for extraction if a second wiki format or manifest store is added."
+    }
+  ],
+  "testing_gaps": [
+    {
+      "gap": "No test exercises --config flag being passed, so its no-op status is not asserted and the dead flag could remain unnoticed for multiple release cycles.",
+      "files": ["src/chunking/cli.py", "tests/test_cli_smoke.py"]
+    },
+    {
+      "gap": "_ginza_model_version's broad except-all fallback to 'unknown' is not exercised by any test with a broken analyzer.build_config(). A test that passes a stub without build_config() would immediately expose whether the fallback is intentional or a swallowed error.",
+      "files": ["src/chunking/ingest.py", "tests/test_ingest.py"]
+    }
+  ]
+}

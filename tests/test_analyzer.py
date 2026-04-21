@@ -30,7 +30,7 @@ requires_ginza = pytest.mark.skipif(
 
 
 def test_schema_imports_without_spacy() -> None:
-    from chunking.schema import AnalyzerConfig, EntityMention
+    from lorebook_chunker.schema import AnalyzerConfig, EntityMention
 
     em = EntityMention(name="test", ner_label="PERSON", char_start=0, char_end=4)
     assert em.name == "test"
@@ -42,7 +42,7 @@ def test_schema_imports_without_spacy() -> None:
 
 def test_analyzer_json_config_round_trip_without_spacy() -> None:
     """AnalyzerConfig の JSON 往復 (Ginza 不要)."""
-    from chunking.schema import AnalyzerConfig
+    from lorebook_chunker.schema import AnalyzerConfig
 
     original = AnalyzerConfig(
         strict_match={
@@ -64,7 +64,7 @@ def test_analyzer_json_config_round_trip_without_spacy() -> None:
 
 @requires_ginza
 def test_iter_sentences_basic() -> None:
-    from chunking.analyzer import JapaneseAnalyzer
+    from lorebook_chunker.analyzer import JapaneseAnalyzer
 
     analyzer = JapaneseAnalyzer()
     sents = list(analyzer.iter_sentences("これは一文目です。これは二文目です。"))
@@ -73,7 +73,7 @@ def test_iter_sentences_basic() -> None:
 
 @requires_ginza
 def test_iter_sentences_empty() -> None:
-    from chunking.analyzer import JapaneseAnalyzer
+    from lorebook_chunker.analyzer import JapaneseAnalyzer
 
     analyzer = JapaneseAnalyzer()
     assert list(analyzer.iter_sentences("")) == []
@@ -81,7 +81,7 @@ def test_iter_sentences_empty() -> None:
 
 @requires_ginza
 def test_iter_entities_detects_person() -> None:
-    from chunking.analyzer import JapaneseAnalyzer
+    from lorebook_chunker.analyzer import JapaneseAnalyzer
 
     analyzer = JapaneseAnalyzer()
     ents = list(analyzer.iter_entities("田中太郎は東京都に住んでいる。"))
@@ -95,7 +95,7 @@ def test_iter_entities_detects_person() -> None:
 
 @requires_ginza
 def test_tokenize_for_tfidf_filters_particles() -> None:
-    from chunking.analyzer import JapaneseAnalyzer
+    from lorebook_chunker.analyzer import JapaneseAnalyzer
 
     analyzer = JapaneseAnalyzer()
     tokens = analyzer.tokenize_for_tfidf("東京に行きました。")
@@ -106,7 +106,7 @@ def test_tokenize_for_tfidf_filters_particles() -> None:
 
 @requires_ginza
 def test_analyzer_json_round_trip(tmp_path: Path) -> None:
-    from chunking.analyzer import JapaneseAnalyzer
+    from lorebook_chunker.analyzer import JapaneseAnalyzer
 
     analyzer = JapaneseAnalyzer()
     path = tmp_path / "analyzer.json"
@@ -120,8 +120,8 @@ def test_analyzer_json_round_trip(tmp_path: Path) -> None:
 @requires_ginza
 def test_analyzer_json_strict_mismatch(tmp_path: Path) -> None:
     import json
-    from chunking.analyzer import JapaneseAnalyzer
-    from chunking.schema import AnalyzerVersionMismatchError
+    from lorebook_chunker.analyzer import JapaneseAnalyzer
+    from lorebook_chunker.schema import AnalyzerVersionMismatchError
 
     analyzer = JapaneseAnalyzer()
     path = tmp_path / "analyzer.json"

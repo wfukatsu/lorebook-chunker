@@ -14,7 +14,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from chunking.schema import KeywordEntry
+from lorebook_chunker.schema import KeywordEntry
 
 # analyzer callable 契約: str -> list[str]
 AnalyzerCallable = Callable[[str], list[str]]

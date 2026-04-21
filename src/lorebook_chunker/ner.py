@@ -11,7 +11,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Iterable, Protocol, Sequence
 
-from chunking.schema import ChunkRecord, EntityAggregate, EntityMention
+from lorebook_chunker.schema import ChunkRecord, EntityAggregate, EntityMention
 
 DEFAULT_TARGET_LABELS: tuple[str, ...] = ("PERSON", "ORG", "LOC", "PRODUCT")
 DEFAULT_MIN_MENTIONS = 3

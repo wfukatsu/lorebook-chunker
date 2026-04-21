@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import pytest
 
-from chunking.chunker import (
+from lorebook_chunker.chunker import (
     Chunker,
     simple_japanese_splitter,
 )
-from chunking.normalize import normalize_text
+from lorebook_chunker.normalize import normalize_text
 
 
 def _build_chunker(**kwargs) -> Chunker:

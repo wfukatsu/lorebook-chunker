@@ -1,14 +1,14 @@
 """NER aggregation + filename sanitization のテスト."""
 from __future__ import annotations
 
-from chunking.ner import (
+from lorebook_chunker.ner import (
     DEFAULT_TARGET_LABELS,
     aggregate_entities,
     attach_entities_to_chunks,
     extract_entities_per_chunk,
     sanitize_entity_filename,
 )
-from chunking.schema import ChunkRecord, EntityMention
+from lorebook_chunker.schema import ChunkRecord, EntityMention
 
 
 class _StubAnalyzer:

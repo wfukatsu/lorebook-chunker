@@ -1,0 +1,69 @@
+{
+  "reviewer": "security",
+  "findings": [
+    {
+      "id": "SEC-001",
+      "severity": "P1",
+      "confidence": 0.95,
+      "title": "allow_pickle=True in TfidfBuilder.load enables RCE via crafted vocab.npz",
+      "category": "insecure-deserialization",
+      "file": "src/chunking/tfidf.py",
+      "line": 129,
+      "pre_existing": false,
+      "description": "TfidfBuilder.load calls np.load(path, allow_pickle=True). numpy's allow_pickle=True enables deserialization of Python objects stored as object-dtype arrays via pickle. A crafted vocab.npz containing a malicious object-dtype array (using __reduce__) executes arbitrary code at load time. This was confirmed: a test .npz with an exploit object in vocabulary_terms triggered code execution when loaded with allow_pickle=True. The vocab.npz path is user-controlled via `chunking query <output_dir>`, making this reachable by pointing query at an attacker-supplied directory.",
+      "why_it_matters": "A user running `chunking query /attacker/controlled/dir` against a crafted vocab.npz gets full RCE under their own UID. In a CI/CD pipeline where output dirs are downloaded from artifact storage or shared, this is exploitable without physical access.",
+      "fix": "The vocabulary_terms and config_json arrays are stored as object dtype purely because np.savez_compressed does not natively support variable-length strings and Python dicts. Fix by serializing strings to a fixed Unicode dtype (np.savez_compressed uses str_ dtype: vocabulary_terms=vocab_array.astype(str)) and JSON-encoding config as a plain bytes/str array. Then load with allow_pickle=False (the safe default). No pickle objects are needed.",
+      "evidence": [
+        "tfidf.py:129 — np.load(path, allow_pickle=True)",
+        "tfidf.py:114 — vocab_array = np.array(terms_in_order, dtype=object)",
+        "tfidf.py:123 — config_json=np.array(json.dumps(config), dtype=object)",
+        "query.py:75 — arts = TfidfBuilder.load(vocab_path) where vocab_path = user-supplied output_dir / 'vocab.npz'",
+        "Manual PoC confirmed: crafted .npz with malicious object-dtype array executes __reduce__ on np.load with allow_pickle=True"
+      ]
+    },
+    {
+      "id": "SEC-002",
+      "severity": "P2",
+      "confidence": 0.80,
+      "title": "Supply-chain: ja-ginza-electra wheel pinned by URL without hash verification",
+      "category": "supply-chain",
+      "file": "pyproject.toml",
+      "line": 17,
+      "pre_existing": false,
+      "description": "The dependency 'ja-ginza-electra @ https://github.com/megagonlabs/ginza/releases/download/v5.2.0/ja_ginza_electra-5.2.0-py3-none-any.whl' is pinned to a specific GitHub release URL but carries no hash fragment (e.g., #sha256=...). pip with --require-hashes would reject it, but without that flag it downloads and installs the wheel trusting only TLS and the GitHub release tag — which can be silently replaced if the upstream repository is compromised or the release tag is moved. This package ships a large spaCy NLP model and runs arbitrary Python code during import. The same pattern does not apply to the other dependencies because they go through PyPI and can be pinned via a lockfile.",
+      "why_it_matters": "A compromised upstream GitHub release (tag reuse, repository takeover) would install arbitrary code into every fresh environment without any build-time integrity signal. This is a one-package supply chain risk for a model file executed inside the NLP pipeline.",
+      "fix": "Add a hash fragment to the URL: ja-ginza-electra @ https://...whl#sha256=<verified-hash>. Alternatively, mirror the wheel to an internal artifact registry and pin from there. For CI, enforce pip install --require-hashes with a lockfile (pip-compile --generate-hashes).",
+      "evidence": [
+        "pyproject.toml:17 — URL dependency without #sha256= fragment"
+      ]
+    },
+    {
+      "id": "SEC-003",
+      "severity": "P2",
+      "confidence": 0.75,
+      "title": "LLM-controlled entity name written as wiki filename without directory-escape guard",
+      "category": "path-traversal",
+      "file": "src/chunking/ner.py",
+      "line": 140,
+      "pre_existing": false,
+      "description": "sanitize_entity_filename strips path-separator characters (/ and \\) and replaces them with underscores, which prevents the sanitized string itself from containing a literal slash. However, the function does not strip or encode the dot (.) character. The resulting filename is immediately joined to entities_dir via Path division: out_path = self._config.entities_dir / filename (wiki.py:567). Because the dot is preserved, an entity name consisting entirely of dots — e.g., '...' — produces a filename like 'PERSON______.md' (dots replaced? No: dots are not in _UNSAFE_FILENAME_RE). Testing confirms _UNSAFE_FILENAME_RE = r'[/\\\\:*?\"<>|\\s]' does not include '.', so entity_name='.' produces safe_name='.' and filename='PERSON__..md'. Path('/staging/entities') / 'PERSON__..md' resolves as a literal file with that name in entities_dir — no traversal because there is no slash component. This is not exploitable for directory escape via the Path join. Confidence is moderate because a deeper concern exists: out_path.parent.mkdir(parents=True, exist_ok=True) is called before write, and if filename somehow contained a subdirectory component, it would create directories outside entities_dir. Confirmed: since / is always stripped, no subdirectory component can be introduced. Risk is limited to writing files with unusual names (e.g., '.md', '..md') rather than escaping the directory.",
+      "why_it_matters": "While full directory traversal is blocked, writing files named '.' or '..' or names starting with dots could interfere with filesystem tooling, git status, or downstream scripts that glob entities/*.md. A hostile corpus could clutter or confuse the entity directory.",
+      "fix": "Add a guard after sanitization: if the base name (without .md) is empty, consists only of dots, or starts with '.', replace it with a deterministic hash-based fallback. Example: if not safe_name or safe_name.lstrip('.') == '': safe_name = 'entity_' + hashlib.sha256(entity_name.encode()).hexdigest()[:8]",
+      "evidence": [
+        "ner.py:29 — _UNSAFE_FILENAME_RE does not include '.'",
+        "ner.py:148-161 — sanitize_entity_filename logic",
+        "wiki.py:566-568 — filename = sanitize_entity_filename(...); out_path = entities_dir / filename; out_path.parent.mkdir(parents=True, exist_ok=True)"
+      ]
+    }
+  ],
+  "residual_risks": [
+    "The LLM-generated summary text (result.text) is written verbatim into wiki .md files (wiki.py:578). For a local CLI this carries no injection risk, but if these .md files are later rendered in a web context without escaping, the LLM output could contain markdown or HTML that is rendered. This is outside the current threat model but should be noted if the output is ever served.",
+    "ANTHROPIC_API_KEY is read from the environment and passed to the Anthropic SDK. Standard Python logging does not dump local variables, so the key is not exposed via logger.exception. However, if a third-party logging integration (e.g., Sentry, structlog with locals) is added in future, the api_key kwarg stored in AnthropicLLMClient.__init__ scope could be captured. No current exposure.",
+    "The staging directory is placed as output_dir.with_name(output_dir.name + '.staging') — always a sibling of the target, in the same parent. This means a cross-device rename is possible if the parent is a mount boundary, falling back to shutil.copytree. The copytree fallback does not follow symlinks by default (symlinks=False), so symlink traversal during copy is not a concern. However, the fallback is not atomic and leaves a window where both target and staging exist simultaneously."
+  ],
+  "testing_gaps": [
+    "No test exercises TfidfBuilder.load with a crafted vocab.npz containing an object-dtype array to verify the deserialization boundary. Adding a test that saves and reloads with allow_pickle=False (after fixing) would serve as a regression guard.",
+    "No test exercises sanitize_entity_filename with entity names consisting only of dots or Unicode dot-like characters to verify the output is a safe, non-empty filename.",
+    "No test verifies that chunking query against an output_dir lacking proper artifacts (or containing adversarial artifacts) returns a safe error rather than executing side effects."
+  ]
+}

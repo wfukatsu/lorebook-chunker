@@ -6,7 +6,7 @@ from typing import Any
 
 import ollama
 
-from chunking.llm import (
+from lorebook_chunker.llm import (
     GenerateResult,
     LLMPermanentError,
     LLMRetryableError,

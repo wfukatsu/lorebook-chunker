@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterator
 
-from chunking.schema import ChunkFileCorruptError
+from lorebook_chunker.schema import ChunkFileCorruptError
 
 
 def load_chunks(path: Path) -> Iterator[dict[str, Any]]:

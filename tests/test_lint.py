@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from chunking.ingest import IngestConfig, IngestRunner
-from chunking.lint import (
+from lorebook_chunker.ingest import IngestConfig, IngestRunner
+from lorebook_chunker.lint import (
     FATAL,
     INFO,
     WARNING,

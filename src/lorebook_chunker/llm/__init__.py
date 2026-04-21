@@ -57,15 +57,15 @@ def get_client(backend: str, config: dict[str, Any] | None = None) -> LLMClient:
     """
     config = config or {}
     if backend == "anthropic":
-        from chunking.llm.anthropic_client import AnthropicLLMClient
+        from lorebook_chunker.llm.anthropic_client import AnthropicLLMClient
 
         return AnthropicLLMClient(**config)
     if backend == "ollama":
-        from chunking.llm.ollama_client import OllamaLLMClient
+        from lorebook_chunker.llm.ollama_client import OllamaLLMClient
 
         return OllamaLLMClient(**config)
     if backend == "openai":
-        from chunking.llm.openai_client import OpenAIPlaceholderClient
+        from lorebook_chunker.llm.openai_client import OpenAIPlaceholderClient
 
         return OpenAIPlaceholderClient(**config)
     raise LLMPermanentError(f"unknown LLM backend: {backend!r}")

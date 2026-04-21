@@ -1,7 +1,7 @@
 """normalize_text の単体テスト. 外部依存なし."""
 from __future__ import annotations
 
-from chunking.normalize import NORMALIZATION_SPEC, normalize_text
+from lorebook_chunker.normalize import NORMALIZATION_SPEC, normalize_text
 
 
 def test_nfkc_fullwidth_to_halfwidth() -> None:

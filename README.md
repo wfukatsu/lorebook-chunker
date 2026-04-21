@@ -1,4 +1,4 @@
-# chunking — 日本語 RAG 向けチャンク化 + TF-IDF + 固有名詞 Wiki CLI
+# lorebook-chunker — 日本語 RAG 向けチャンク化 + TF-IDF + 固有名詞 Wiki CLI
 
 > **本スクリプトのアイデンティティ**
 > RAG 用コーパスの前処理・健全性・一級エンティティ知識ベース生成ツールです。
@@ -74,8 +74,8 @@
 ### パッケージ構成
 
 ```
-src/chunking/
-  __main__.py           python -m chunking → cli.main()
+src/lorebook_chunker/
+  __main__.py           python -m lorebook_chunker → cli.main()
   cli.py                argparse / サブコマンド登録 / identity banner
   normalize.py          NFKC + LF + trim + collapse を 1 関数で (決定論契約)
   analyzer.py           Ginza + Sudachi のラッパ。Ginza 5.2 ↔ spacy 3.8 の shim 内蔵
@@ -264,7 +264,7 @@ pip install -e '.[dev]'
 python -m spacy validate                # ja_ginza_electra の導入確認 (✔ が出れば OK)
 ```
 
-`ja_ginza_electra` は PyPI 未公開のため GitHub Releases の wheel を URL 依存 (sha256 ピン) で取得します。初回 `chunking ingest` 実行時に ELECTRA transformer 本体 (~400MB) が HuggingFace Hub から追加ダウンロードされます (オフラインなら `HF_HUB_OFFLINE=1` + 事前キャッシュが必要)。
+`ja_ginza_electra` は PyPI 未公開のため GitHub Releases の wheel を URL 依存 (sha256 ピン) で取得します。初回 `lorebook-chunker ingest` 実行時に ELECTRA transformer 本体 (~400MB) が HuggingFace Hub から追加ダウンロードされます (オフラインなら `HF_HUB_OFFLINE=1` + 事前キャッシュが必要)。
 
 ### LLM バックエンドの準備
 
@@ -285,19 +285,19 @@ python -m spacy validate                # ja_ginza_electra の導入確認 (✔ 
 
 ```bash
 # 既定 (Anthropic, claude-haiku-4-5) で処理
-chunking ingest samples/ out/
+lorebook-chunker ingest samples/ out/
 
 # Ollama ローカルモデルを明示指定
-chunking ingest samples/ out/ --llm-backend ollama --llm-model qwen3:8b
+lorebook-chunker ingest samples/ out/ --llm-backend ollama --llm-model qwen3:8b
 
 # 検索 (ベースライン)
-chunking query out/ "合併の背景" --top-k 5
+lorebook-chunker query out/ "合併の背景" --top-k 5
 
 # 健全性チェック
-chunking lint out/
+lorebook-chunker lint out/
 ```
 
-### `chunking ingest`
+### `lorebook-chunker ingest`
 
 | フラグ | 既定 | 効果 |
 |---|---|---|
@@ -323,29 +323,29 @@ chunking lint out/
 
 ```bash
 # 1. 開発ループ: LLM 無しで chunks/vocab/analyzer の挙動だけ追う
-chunking ingest samples/ out/ --skip-wiki
+lorebook-chunker ingest samples/ out/ --skip-wiki
 
 # 2. CI: Ollama でオフライン & 予算キャップ付きで wiki も含めて確認
-chunking ingest samples/ out/ --llm-backend ollama --llm-model qwen3:8b \
+lorebook-chunker ingest samples/ out/ --llm-backend ollama --llm-model qwen3:8b \
     --max-llm-calls 10 --format json --quiet
 
 # 3. プロンプト改定後の一括更新
-chunking ingest samples/ out/ --force-regenerate
+lorebook-chunker ingest samples/ out/ --force-regenerate
 
 # 4. 前回予算切れ / ネットワーク障害で失敗した分だけリカバリ
-chunking ingest samples/ out/ --retry-failed
+lorebook-chunker ingest samples/ out/ --retry-failed
 
 # 5. 機械可読サマリだけ取る (エージェントがパイプ受け)
-chunking ingest samples/ out/ --format json --quiet | jq .exit_code
+lorebook-chunker ingest samples/ out/ --format json --quiet | jq .exit_code
 ```
 
 ingest 完了時に `output_dir/ingest_result.json` を必ず書き出します。JSON 形式指定時はこれが stdout にもそのまま出ます。
 
-### `chunking query`
+### `lorebook-chunker query`
 
 ```bash
-chunking query out/ "合併の背景" --top-k 5
-chunking query out/ "合併の背景" --format json | jq '.[0].chunk_id'
+lorebook-chunker query out/ "合併の背景" --top-k 5
+lorebook-chunker query out/ "合併の背景" --format json | jq '.[0].chunk_id'
 ```
 
 | フラグ | 既定 | 効果 |
@@ -355,11 +355,11 @@ chunking query out/ "合併の背景" --format json | jq '.[0].chunk_id'
 
 cosine 計算は `vocab.npz` と同じ analyzer をランタイムに再現した上で行われるため、`ingest` 時と同じ解析器設定が必要です (`analyzer.json.strict_match` で検証)。**クエリが OOV / ゼロトークンの場合は exit 4** を返し、「一致なし」と区別できます。
 
-### `chunking lint`
+### `lorebook-chunker lint`
 
 ```bash
-chunking lint out/
-chunking lint out/ --format json | jq '.summary'
+lorebook-chunker lint out/
+lorebook-chunker lint out/ --format json | jq '.summary'
 ```
 
 | フラグ | 既定 | 効果 |

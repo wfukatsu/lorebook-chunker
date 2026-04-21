@@ -23,16 +23,16 @@ from typing import Any, Callable, Iterable, Literal, Sequence
 
 import yaml
 
-from chunking.llm import (
+from lorebook_chunker.llm import (
     GenerateResult,
     LLMClient,
     LLMPermanentError,
     LLMPreflightError,
     LLMRetryableError,
 )
-from chunking.ner import sanitize_entity_filename
-from chunking.normalize import normalize_text
-from chunking.schema import ChunkRecord, EntityAggregate
+from lorebook_chunker.ner import sanitize_entity_filename
+from lorebook_chunker.normalize import normalize_text
+from lorebook_chunker.schema import ChunkRecord, EntityAggregate
 
 logger = logging.getLogger(__name__)
 
@@ -462,7 +462,7 @@ class WikiGenerator:
     # ---- pre-flight --------------------------------------------------
 
     def _preflight(self) -> None:
-        prompt = pkg_resources.files("chunking.resources").joinpath(
+        prompt = pkg_resources.files("lorebook_chunker.resources").joinpath(
             "preflight_prompt.txt"
         ).read_text(encoding="utf-8")
         try:

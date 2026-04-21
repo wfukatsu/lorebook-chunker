@@ -1,4 +1,4 @@
-"""CLI entrypoint: `chunking ingest | query | lint`."""
+"""CLI entrypoint: `lorebook-chunker ingest | query | lint`."""
 from __future__ import annotations
 
 import argparse
@@ -6,7 +6,7 @@ import sys
 from typing import Sequence
 
 IDENTITY_BANNER = (
-    "chunking: 日本語 RAG 前処理・コーパス健全性・一級エンティティ知識ベース生成ツール "
+    "lorebook-chunker: 日本語 RAG 前処理・コーパス健全性・一級エンティティ知識ベース生成ツール "
     "(本番検索は下流 vector store で行う前提)"
 )
 
@@ -77,7 +77,7 @@ def _add_ingest(subparsers: argparse._SubParsersAction) -> None:
 
 
 def _add_query(subparsers: argparse._SubParsersAction) -> None:
-    from chunking.query import positive_int
+    from lorebook_chunker.query import positive_int
 
     p = subparsers.add_parser(
         "query",
@@ -103,7 +103,7 @@ def _add_query(subparsers: argparse._SubParsersAction) -> None:
 
 
 def _add_lint(subparsers: argparse._SubParsersAction) -> None:
-    from chunking.lint import (
+    from lorebook_chunker.lint import (
         DEFAULT_DEGENERATE_L2,
         DEFAULT_DEGENERATE_NNZ,
         DEFAULT_DUPLICATE_COSINE,
@@ -172,7 +172,7 @@ def _add_lint(subparsers: argparse._SubParsersAction) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="chunking",
+        prog="lorebook-chunker",
         description=IDENTITY_BANNER,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -187,13 +187,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "ingest":
-        from chunking.ingest import run_ingest
+        from lorebook_chunker.ingest import run_ingest
         return run_ingest(args)
     if args.command == "query":
-        from chunking.query import run_query
+        from lorebook_chunker.query import run_query
         return run_query(args)
     if args.command == "lint":
-        from chunking.lint import run_lint
+        from lorebook_chunker.lint import run_lint
         return run_lint(args)
 
     parser.print_help(sys.stderr)

@@ -1,0 +1,140 @@
+{
+  "reviewer": "cli-readiness",
+  "framework": "argparse (stdlib)",
+  "findings": [
+    {
+      "id": "CLI-001",
+      "title": "query output is human-prose only — no --json / structured mode",
+      "severity": "P1",
+      "pre_existing": false,
+      "autofix_class": "manual",
+      "owner": "human",
+      "confidence": 0.97,
+      "command_type": "read/query",
+      "file": "src/chunking/query.py",
+      "lines": [151, 157],
+      "why_it_matters": "run_query() writes formatted multi-line prose blocks to stdout with embedded labels like '[1] chunk_id=... score=... source=...'. An agent consuming query results must parse free text with brittle string splitting. Any cosmetic change (label reordering, whitespace, Japanese text) silently breaks the agent's parser. There is no --json flag, no --format flag, and no auto-detection of non-TTY stdout to switch to machine-readable output.",
+      "evidence": [
+        "query.py:151-157: print(f'\\n[{i}] chunk_id={hit.chunk_id} score={hit.score:.4f} source={hit.source}') and two more print() calls per hit, all to stdout, no structured alternative"
+      ],
+      "suggested_fix": "Add `--format {human,json}` (default `human` for TTY, `json` when not `sys.stdout.isatty()`). In json mode, `json.dumps([{'rank':i,'chunk_id':h.chunk_id,'score':h.score,'source':h.source,'text':h.text,'top_keywords':h.top_keywords} for i,h in enumerate(result.hits,1)], ensure_ascii=False)` to stdout; all diagnostic/warn messages stay on stderr. argparse: `p.add_argument('--format', choices=['human','json'], default=None)` then resolve default at runtime with `sys.stdout.isatty()` check."
+    },
+    {
+      "id": "CLI-002",
+      "title": "lint exit code is binary (0/1) — warnings indistinguishable from clean pass",
+      "severity": "P1",
+      "pre_existing": false,
+      "autofix_class": "manual",
+      "owner": "human",
+      "confidence": 0.95,
+      "command_type": "streaming/logging",
+      "file": "src/chunking/lint.py",
+      "lines": [293],
+      "why_it_matters": "run_lint() returns exit 0 when there are zero FATAL findings, regardless of how many WARNING findings exist. An agent wiring `chunking lint` into a quality gate cannot distinguish 'clean corpus' from 'corpus with 20 duplicate-chunk warnings'. The plan explicitly specifies fatal=2, warning=1, success=0 but the implementation collapses fatal>0 to 1 and everything else to 0. Agents scripting `if exit_code == 1: trigger_reindex` cannot work.",
+      "evidence": [
+        "lint.py:293: `return 0 if report.count(FATAL) == 0 else 1` — warnings return 0, fatals return 1, no exit code 2 used at all"
+      ],
+      "suggested_fix": "Align with the plan: `if report.count(FATAL): return 2; if report.count(WARNING): return 1; return 0`. Document in the argparse help for the lint subcommand: add an epilog string `'Exit codes: 0=clean, 1=warnings only, 2=fatal findings'` via `p.formatter_class=argparse.RawDescriptionHelpFormatter` and `p.epilog='...'`."
+    },
+    {
+      "id": "CLI-003",
+      "title": "lint has no --format json — machine parsing requires regex over Japanese prose",
+      "severity": "P2",
+      "pre_existing": false,
+      "autofix_class": "manual",
+      "owner": "human",
+      "confidence": 0.95,
+      "command_type": "read/query",
+      "file": "src/chunking/lint.py",
+      "lines": [296, 305],
+      "why_it_matters": "All lint output goes to stderr as Japanese-language prose lines like '[致命] missing_artifact: 必要成果物が存在しません'. An agent must scrape Japanese severity labels from stderr to count fatal/warning items, which is fragile. lint.md is written as a Markdown table — also not parseable without a Markdown parser. A --format json mode emitting structured {severity, category, message, detail} records would let agents filter, count, or react to specific categories without text parsing.",
+      "evidence": [
+        "lint.py:296-304: _print_human_report() writes all findings to stderr as '[{f.severity}] {f.category}: {f.message}', no JSON alternative",
+        "lint.py:307-329: _write_lint_md() writes Markdown table to disk, no JSON equivalent on stdout"
+      ],
+      "suggested_fix": "Add `--format {human,json}` to the lint subparser. In json mode: print `json.dumps({'summary':{'fatal':N,'warning':W,'info':I},'findings':[{'severity':f.severity,'category':f.category,'message':f.message,'detail':f.detail} for f in report.findings]}, ensure_ascii=False)` to stdout; suppress _print_human_report. TTY auto-detect as default."
+    },
+    {
+      "id": "CLI-004",
+      "title": "ingest success summary and all operational messages go to stderr — no machine-readable stdout signal on success",
+      "severity": "P2",
+      "pre_existing": false,
+      "autofix_class": "manual",
+      "owner": "human",
+      "confidence": 0.90,
+      "command_type": "mutating",
+      "file": "src/chunking/ingest.py",
+      "lines": [448, 458],
+      "why_it_matters": "On success, run_ingest() prints 'ingest OK: N chunks from M files -> output_dir' to stderr (line 452-457). There is no stdout output at all on the happy path. An agent chaining `ingest` into a pipeline cannot capture the chunk count or output path without parsing stderr, which is mixed with [warn] and [error] lines. A JSON summary on stdout (or at minimum a parseable single-line stdout success record) lets agents confirm ingest results without touching stderr.",
+      "evidence": [
+        "ingest.py:452-457: `print(f'ingest OK: ...', file=sys.stderr)` — success confirmation written to stderr, stdout is silent"
+      ],
+      "suggested_fix": "On success (exit_code==0), write a JSON summary to stdout: `json.dumps({'status':'ok','chunks':result.chunks_generated,'input_files':result.total_input_files - result.skipped_files,'output_dir':str(cfg.output_dir),'wiki':dataclasses.asdict(result.wiki_stats) if result.wiki_stats else None}, ensure_ascii=False)`. Keep human prose on stderr. A `--quiet` flag can suppress the stderr banner. argparse: `p.add_argument('--quiet', action='store_true', help='stderr 出力を抑制')`."
+    },
+    {
+      "id": "CLI-005",
+      "title": "ingest exit codes 2-10 are undocumented in help text and README",
+      "severity": "P2",
+      "pre_existing": false,
+      "autofix_class": "manual",
+      "owner": "human",
+      "confidence": 0.92,
+      "command_type": "mutating",
+      "file": "src/chunking/ingest.py",
+      "lines": [122, 133, 163, 196, 253, 280],
+      "why_it_matters": "ingest uses exit codes 2 (no input files), 3 (LLM backend unavailable), 4 (analyzer init failed), 5 (0 chunks produced), 6 (wiki generation aborted), 10 (unexpected exception). An agent must know whether to retry, fix configuration, or escalate. Without a documented code table, the agent must treat every non-zero exit as an opaque failure and request human intervention. Code 10 (generic exception) in particular gives no retry guidance.",
+      "evidence": [
+        "ingest.py:122 exit_code=2 (no .txt files), 133 exit_code=3 (LLM), 163 exit_code=4 (analyzer), 196 exit_code=5 (0 chunks), 253 exit_code=6 (wiki), 280 exit_code=10 (exception)",
+        "cli.py _add_ingest(): no epilog documenting these codes",
+        "README.md: no exit code table"
+      ],
+      "suggested_fix": "Add `p.epilog` to _add_ingest() (and _add_query(), _add_lint()) with a terse exit-code table. Use `p.formatter_class = argparse.RawDescriptionHelpFormatter`. Example: 'Exit codes: 0=success 2=no input files 3=LLM unavailable 4=analyzer init failed 5=zero chunks 6=wiki aborted 10=unexpected error'. Mirror in README.md under a '## Exit codes' section."
+    },
+    {
+      "id": "CLI-006",
+      "title": "query \"no matching chunks\" returns exit 0 — agent cannot distinguish empty result from error",
+      "severity": "P2",
+      "pre_existing": false,
+      "autofix_class": "manual",
+      "owner": "human",
+      "confidence": 0.88,
+      "command_type": "read/query",
+      "file": "src/chunking/query.py",
+      "lines": [148, 150],
+      "why_it_matters": "When q_vec.nnz==0 (query outside vocabulary) or when score filtering produces zero hits, run_query() prints '(no matching chunks)' to stderr and returns exit 0. In --json mode (not yet implemented) this means an agent receives empty output on stdout with exit 0 and must parse stderr to detect the empty-results case vs. actual 0-chunk corpus. A distinct exit code (e.g. 4) for 'query succeeded but no hits' allows agents to branch without stderr parsing.",
+      "evidence": [
+        "query.py:148-150: `print('(no matching chunks)', file=sys.stderr); return 0` — zero-hit treated same as successful hits",
+        "query.py:103-109: q_vec.nnz==0 path also returns exit_code=0 with error_message set but hits=[]"
+      ],
+      "suggested_fix": "Return exit code 4 (or a documented constant) when result.hits is empty after a successful query (artifacts loaded, no load errors). Document: '0=hits returned, 2=artifacts missing, 3=artifact corrupt, 4=no matching chunks'. This gives agents a clean branch without stderr parsing."
+    },
+    {
+      "id": "CLI-007",
+      "title": "lint tuning parameters (thresholds) have no CLI flags — agents cannot adjust sensitivity without code changes",
+      "severity": "P3",
+      "pre_existing": false,
+      "autofix_class": "manual",
+      "owner": "human",
+      "confidence": 0.83,
+      "command_type": "read/query",
+      "file": "src/chunking/lint.py",
+      "lines": [51, 61],
+      "why_it_matters": "run_lint_impl() accepts pairwise_threshold, duplicate_cosine, degenerate_l2, degenerate_nnz, levenshtein_ratio, target_chunk_chars, max_chunk_chars as keyword arguments with defaults, but run_lint() (the CLI handler) calls run_lint_impl(output_dir) with no overrides. An agent tuning corpus quality gates must either fork the code or accept the hardcoded defaults. Adding --duplicate-cosine, --max-chunk-chars, etc. as optional argparse flags with defaults matching the constants would give agents and CI pipelines per-invocation control.",
+      "evidence": [
+        "lint.py:288-293: run_lint() passes no keyword args to run_lint_impl(), all tuning params use hardcoded defaults",
+        "lint.py:25-29: constants DEFAULT_LINT_PAIRWISE_THRESHOLD=2000, DEFAULT_DUPLICATE_COSINE=0.95 etc. defined but not exposed as flags"
+      ],
+      "suggested_fix": "In _add_lint(), add optional flags: `p.add_argument('--duplicate-cosine', type=float, default=DEFAULT_DUPLICATE_COSINE)`, `p.add_argument('--max-chunk-chars', type=int, default=1500)`, `p.add_argument('--pairwise-threshold', type=int, default=DEFAULT_LINT_PAIRWISE_THRESHOLD)`. Pass them from run_lint() to run_lint_impl(). This is idiomatic argparse with defaults defined as module constants."
+    }
+  ],
+  "residual_risks": [
+    "The ANSI / terminal color risk is not present in this codebase (no color library used, all output is plain print()). However if a logging handler with colored formatters is added upstream, all subcommands share stderr and could emit ANSI to pipes. A NO_COLOR env-var check in a shared logging setup would pre-empt this.",
+    "ingest is effectively idempotent via atomic swap + manifest caching, but there is no --dry-run flag. An agent that wants to preview the operation without writing cannot do so without inspecting internals.",
+    "The identity banner (IDENTITY_BANNER constant) is present in description= but is not emitted to stdout/stderr at runtime for ingest. Plan R9 mentions a parseable banner on ingest start; the current implementation only shows it in --help output."
+  ],
+  "testing_gaps": [
+    "No test exercises run_query() with non-TTY stdout to verify that structured output (once added) is correct and complete.",
+    "No test asserts that lint exit codes match the fatal/warning/success contract from the plan (fatal=2, warning=1, success=0). Current tests likely pass with the broken 0/1 mapping.",
+    "No test verifies that all ingest error paths (exit codes 2-10) produce a non-empty error message on stderr."
+  ]
+}

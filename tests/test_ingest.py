@@ -8,10 +8,10 @@ from typing import Any, Iterable
 
 import pytest
 
-from chunking.chunker import simple_japanese_splitter
-from chunking.ingest import IngestConfig, IngestRunner, run_ingest
-from chunking.llm import GenerateResult, LLMPermanentError
-from chunking.schema import AnalyzerConfig, EntityMention
+from lorebook_chunker.chunker import simple_japanese_splitter
+from lorebook_chunker.ingest import IngestConfig, IngestRunner, run_ingest
+from lorebook_chunker.llm import GenerateResult, LLMPermanentError
+from lorebook_chunker.schema import AnalyzerConfig, EntityMention
 
 
 class _StubAnalyzer:
@@ -246,7 +246,7 @@ def test_ingest_openai_backend_fails_fast(tmp_path: Path) -> None:
     )
 
     # 実物の get_client を使う (OpenAIPlaceholderClient がコンストラクタで raise する)
-    from chunking.llm import get_client
+    from lorebook_chunker.llm import get_client
     runner = IngestRunner(
         cfg,
         analyzer_factory=lambda path: _StubAnalyzer(),
@@ -299,7 +299,7 @@ def test_run_ingest_cli_wrapper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
         command="ingest",
     )
     # analyzer_factory を差し替えるため、monkeypatch で default を上書き
-    import chunking.ingest as mod
+    import lorebook_chunker.ingest as mod
     monkeypatch.setattr(mod, "default_analyzer_factory", lambda path: _StubAnalyzer())
     exit_code = run_ingest(args)
     assert exit_code == 0
@@ -379,7 +379,7 @@ def test_retry_failed_and_force_regenerate_cooccur_warning(
         config=None,
         command="ingest",
     )
-    import chunking.ingest as mod
+    import lorebook_chunker.ingest as mod
     monkeypatch.setattr(mod, "default_analyzer_factory", lambda path: _StubAnalyzer())
     with caplog.at_level("WARNING"):
         run_ingest(args)

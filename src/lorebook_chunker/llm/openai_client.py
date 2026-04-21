@@ -1,7 +1,7 @@
 """OpenAI placeholder: コンストラクタで即失敗して fail-fast する."""
 from __future__ import annotations
 
-from chunking.llm import GenerateResult, LLMPermanentError
+from lorebook_chunker.llm import GenerateResult, LLMPermanentError
 
 
 class OpenAIPlaceholderClient:

@@ -1,0 +1,115 @@
+{
+  "reviewer": "performance",
+  "findings": [
+    {
+      "id": "PERF-001",
+      "file": "src/chunking/tfidf.py",
+      "line_range": [79, 94],
+      "severity": "warning",
+      "confidence": 0.85,
+      "pre_existing": false,
+      "title": "Per-row Python loop with getrow() in top_keywords_per_chunk scales O(N) in interpreted Python",
+      "description": "top_keywords_per_chunk iterates over every chunk row with matrix.getrow(row_idx), creating a new sparse matrix object on each call. At N=1000 chunks this is 1000 Python-level loop iterations; at N=10000 it is 10000. The correct vectorized approach is to operate directly on matrix.data / matrix.indices / matrix.indptr in one pass, or use np.split on the sorted CSR data to extract top-K per row without materializing per-row objects. The current code is correct but will become a measurable bottleneck when chunk counts grow into the thousands.",
+      "why_it_matters": "This function runs once per ingest over all chunks. At 10k chunks the per-row getrow+argsort loop will take seconds in CPython, while a vectorized alternative (operating on the CSR arrays directly or using sparse_top_k utilities) would run in milliseconds.",
+      "evidence": [
+        "tfidf.py:80: for row_idx in range(matrix.shape[0]):",
+        "tfidf.py:81:     row = matrix.getrow(row_idx)"
+      ],
+      "suggested_fix": "Operate on the CSR arrays directly: iterate over matrix.indptr pairs to get per-row slices of matrix.data and matrix.indices, avoiding the getrow() object allocation. Alternatively use np.argsort or np.argpartition on slices derived from matrix.data split by matrix.indptr differences."
+    },
+    {
+      "id": "PERF-002",
+      "file": "src/chunking/tfidf.py",
+      "line_range": [175, 177],
+      "severity": "warning",
+      "confidence": 0.82,
+      "pre_existing": false,
+      "title": "rebuild_vectorizer runs full Ginza tokenization over entire vocabulary on every query",
+      "description": "rebuild_vectorizer calls vectorizer.fit([\" \".join(vocabulary.keys())]) to make TfidfVectorizer accept idf_ injection. This joins the entire vocabulary — potentially tens of thousands of tokens — into a single whitespace-delimited string and then passes it through the custom analyzer callable, which is analyzer.tokenize_for_tfidf, which calls self._nlp() (Ginza/spaCy). So every query invocation triggers a full Ginza parse of a fabricated document whose length scales linearly with vocabulary size. For a vocabulary of 50k terms the joined string is hundreds of KB, and the Ginza pipeline will spend non-trivial time on it before the actual query token is processed.",
+      "why_it_matters": "Each call to run_query_impl unconditionally calls rebuild_vectorizer (query.py:98), so this cost is paid on every query. The Ginza model is expensive to run. A vocabulary of typical size (5k-50k terms) means passing a very long string through the full NLP pipeline just to satisfy TfidfVectorizer's fit precondition.",
+      "evidence": [
+        "tfidf.py:176: vectorizer.fit([\" \".join(vocabulary.keys())])",
+        "query.py:98: vectorizer = builder.rebuild_vectorizer(analyzer.tokenize_for_tfidf, arts.vocabulary, arts.idf, arts.config)"
+      ],
+      "suggested_fix": "Bypass the dummy fit entirely by setting vectorizer.vocabulary_ and vectorizer._tfidf.idf_ directly after constructing with vocabulary= kwarg, following the sklearn pattern for vocabulary-injection without fitting. The vectorizer already accepts vocabulary= in the constructor; after construction set vectorizer._tfidf = TfidfTransformer(); vectorizer._tfidf.idf_ = idf and mark vectorizer as fitted via sklearn's check_is_fitted convention. This avoids any NLP call."
+    },
+    {
+      "id": "PERF-003",
+      "file": "src/chunking/ner.py",
+      "line_range": [116, 118],
+      "severity": "warning",
+      "confidence": 0.80,
+      "pre_existing": false,
+      "title": "ordered_chunk_ids construction is O(total_chunks) per accepted entity — O(E*C) overall",
+      "description": "Inside aggregate_entities, for each accepted entity the code rebuilds ordered_chunk_ids with a list comprehension that scans all chunks: [c.chunk_id for c in chunks if c.chunk_id in chunk_ids_set]. chunk_ids_set lookup is O(1), but iterating all chunks is O(C) per entity, so the total cost is O(E * C) where E = accepted entities and C = total chunks. With 500 accepted entities and 2000 chunks this is 1M iterations in a tight Python loop. The entity's chunk_ids_set already contains the correct chunk_ids; the only reason to scan all chunks is to preserve their original document order.",
+      "why_it_matters": "aggregate_entities runs once per ingest. At realistic scale (hundreds of entities, thousands of chunks) the O(E*C) inner loop dominates ingest time after chunking itself.",
+      "evidence": [
+        "ner.py:116:     ordered_chunk_ids = [",
+        "ner.py:117:         c.chunk_id for c in chunks if c.chunk_id in chunk_ids_set",
+        "ner.py:118:     ]"
+      ],
+      "suggested_fix": "Build a chunk_id -> position index dict once before the entity loop: chunk_order = {c.chunk_id: i for i, c in enumerate(chunks)}. Then for each entity: ordered_chunk_ids = sorted(chunk_ids_set, key=lambda cid: chunk_order.get(cid, 0)). This reduces the per-entity work from O(C) to O(k log k) where k = entity chunk count."
+    },
+    {
+      "id": "PERF-004",
+      "file": "src/chunking/wiki.py",
+      "line_range": [529, 533],
+      "severity": "warning",
+      "confidence": 0.78,
+      "pre_existing": false,
+      "title": "by_id dict rebuilt from self._chunks on every entity call in _build_entity_prompt and _build_chunk_snippets",
+      "description": "_build_entity_prompt (line 530) does by_id = {c.chunk_id: c for c in self._chunks} inside the method body, and _build_chunk_snippets (line 298) does the same. Both are called once per entity in the generate_all loop. If there are E entities and C chunks, this is O(E * C) dict-construction work, all of it redundant since self._chunks never changes during a run. For 200 entities and 1000 chunks that is 200k object iterations.",
+      "why_it_matters": "This is pure repeated allocation. Building the dict once at WikiGenerator construction time (or at the start of generate_all) and reusing it costs O(C) total instead of O(E*C).",
+      "evidence": [
+        "wiki.py:530: by_id = {c.chunk_id: c for c in self._chunks}",
+        "wiki.py:298: by_id = {c.chunk_id: c for c in chunks}"
+      ],
+      "suggested_fix": "Cache the lookup dict as self._chunks_by_id = {c.chunk_id: c for c in self._chunks} in __init__, and reuse it in both _build_entity_prompt and _build_chunk_snippets. _build_chunk_snippets is a standalone function so pass the prebuilt dict as a parameter or convert it to a method."
+    },
+    {
+      "id": "PERF-005",
+      "file": "src/chunking/ingest.py",
+      "line_range": [167, 213],
+      "severity": "warning",
+      "confidence": 0.75,
+      "pre_existing": false,
+      "title": "Each chunk's text is passed through Ginza three times: iter_sentences (chunking), tokenize_for_tfidf (TF-IDF), and iter_entities (NER)",
+      "description": "During ingest, each input text is Ginza-parsed once via the Chunker's splitter (iter_sentences, line 169), producing chunks. Then for TF-IDF, each chunk.text is passed through analyzer.tokenize_for_tfidf (line 202 via TfidfBuilder), which calls self._nlp(text) again. Then each chunk.text is passed through analyzer.iter_entities (line 212-213 via extract_entities_per_chunk), which calls self._nlp(text) a third time. For N chunks, Ginza is invoked 3N times on chunk texts (plus once per source document for sentence splitting). Ginza/spaCy is the dominant CPU cost of this pipeline; each call runs the full tokenizer + POS + NER pipeline regardless of which outputs are consumed.",
+      "why_it_matters": "Ginza parse is the most expensive single operation in this pipeline. Running it 3x per chunk instead of 1x is a 3x throughput penalty on the NLP step. For a 1000-chunk corpus this means 2000 unnecessary Ginza calls.",
+      "evidence": [
+        "ingest.py:169: splitter=analyzer.iter_sentences (Ginza call #1 per source doc, produces chunks)",
+        "ingest.py:202: analyzer=analyzer.tokenize_for_tfidf (Ginza call #2 per chunk text via TfidfBuilder)",
+        "ingest.py:212: extract_entities_per_chunk(analyzer, all_chunks, ...) (Ginza call #3 per chunk text)"
+      ],
+      "suggested_fix": "Add a combined method to JapaneseAnalyzer: analyze(text) -> (tokens: list[str], entities: list[EntityMention]) that calls self._nlp(text) once and extracts both lemmas and BIO spans from the single Doc object. Call this in a single pass during ingest to populate both TF-IDF input and entity mentions, eliminating the duplicate Ginza calls per chunk."
+    }
+  ],
+  "residual_risks": [
+    {
+      "area": "query.py toarray() on large corpora",
+      "note": "Line 113 calls (matrix @ q_vec.T).toarray().flatten(). For a corpus of 100k chunks this materializes a 100k-element float64 dense array (~800KB) per query. This is acceptable for a CLI tool but would be a concern in a high-QPS server context. argpartition is correctly used after toarray(), so the top-k selection itself is efficient. No finding raised since the tool is a CLI, not a server."
+    },
+    {
+      "area": "analyzer.py load_and_verify double model load",
+      "note": "load_and_verify constructs a full JapaneseAnalyzer (loading the Ginza model) then immediately calls build_config() to verify strict_match. This is one model load, not two. No redundant load found."
+    },
+    {
+      "area": "chunker.py _find_snapped_boundary loop",
+      "note": "The boundary scan in _find_snapped_boundary iterates over all sentence boundaries linearly (O(B) per chunk). B is bounded by sentence count which is small relative to chunk count; since boundaries is sorted and the loop breaks on b > window_max, in practice this is fast. A bisect-based approach would be cleaner but the practical difference is negligible."
+    }
+  ],
+  "testing_gaps": [
+    {
+      "area": "TF-IDF keyword extraction at scale",
+      "note": "No test exercises top_keywords_per_chunk with a matrix larger than the sample fixture (~4 chunks). A benchmark or parametrized test with N=1000 rows would surface the per-row getrow() cost and validate any future optimization."
+    },
+    {
+      "area": "rebuild_vectorizer Ginza cost",
+      "note": "No test measures or documents the expected latency of rebuild_vectorizer. The dummy fit path is covered for correctness (test_tfidf.py) but the performance cost of passing the full vocabulary string through Ginza is untested."
+    },
+    {
+      "area": "aggregate_entities with large chunk and entity counts",
+      "note": "Tests use the 4-file fixture corpus. The O(E*C) ordered_chunk_ids pattern would only manifest at scale; no benchmark test exists to catch regressions if corpus size grows."
+    }
+  ]
+}

@@ -10,10 +10,10 @@ from typing import Any
 
 import numpy as np
 
-from chunking._io import load_chunks
-from chunking.normalize import normalize_text
-from chunking.schema import ChunkFileCorruptError
-from chunking.tfidf import TfidfBuilder
+from lorebook_chunker._io import load_chunks
+from lorebook_chunker.normalize import normalize_text
+from lorebook_chunker.schema import ChunkFileCorruptError
+from lorebook_chunker.tfidf import TfidfBuilder
 
 
 def positive_int(value: str) -> int:
@@ -57,7 +57,7 @@ def run_query_impl(
 ) -> QueryResult:
     """テスト可能な純粋関数. CLI 依存なし."""
     if analyzer_factory is None:
-        from chunking.ingest import default_analyzer_factory
+        from lorebook_chunker.ingest import default_analyzer_factory
         analyzer_factory = default_analyzer_factory
 
     vocab_path = output_dir / "vocab.npz"

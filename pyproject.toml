@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "chunking"
+name = "lorebook-chunker"
 version = "0.1.0"
-description = "日本語 RAG 向けチャンク化 + TF-IDF + 固有名詞 Wiki CLI"
+description = "日本語 RAG 向けチャンク化 + TF-IDF + 固有名詞 Wiki (Lorebook) CLI"
 readme = "README.md"
 # Python 3.13+ では transformers 4.25 系がピンする tokenizers<0.14 の
 # prebuilt wheel が未配布で、Rust ソースビルドにも失敗する. Ginza 5.2 が
@@ -39,13 +39,13 @@ dev = [
 ]
 
 [project.scripts]
-chunking = "chunking.cli:main"
+lorebook-chunker = "lorebook_chunker.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-chunking = ["resources/*"]
+lorebook_chunker = ["resources/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

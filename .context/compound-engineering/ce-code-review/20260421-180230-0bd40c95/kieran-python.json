@@ -1,0 +1,316 @@
+{
+  "reviewer": "kieran-python",
+  "findings": [
+    {
+      "id": "KP-001",
+      "severity": "P1",
+      "confidence": 0.92,
+      "pre_existing": false,
+      "file": "src/chunking/schema.py",
+      "lines": "31-32",
+      "title": "ChunkRecord.top_keywords and .entities typed as list[dict[str, Any]] instead of concrete dataclasses",
+      "summary": "Two fields that carry well-known schemas (top_keywords: [{term, tfidf}], entities: [{name, ner_label, char_start, char_end}]) are typed as list[dict[str, Any]]. The EntityMention dataclass already exists for the entity shape; a KeywordEntry dataclass or TypedDict is absent. Any caller accessing chunk.top_keywords[0]['term'] is entirely un-checked by the type system, and the two parallel update sites (tfidf.py:89-94 and ner.py:69-77) can silently diverge. The on-disk JSON contract makes this concreteness even more important.",
+      "why_it_matters": "The two stable output-contract shapes (chunks.jsonl rows) are explicitly scope-critical per the review spec. Loose dict[str, Any] fields defeat the purpose of having a ChunkRecord dataclass and make static tooling (mypy, pyright) unable to catch callers that misread key names.",
+      "evidence": [
+        "schema.py:31 top_keywords: list[dict[str, Any]] = field(default_factory=list)",
+        "schema.py:32 entities: list[dict[str, Any]] = field(default_factory=list)",
+        "EntityMention already defines the exact entity shape (name, ner_label, char_start, char_end)",
+        "tfidf.py:89-94 builds {term: str, tfidf: float} dicts inline",
+        "ner.py:69-77 builds {name, ner_label, char_start, char_end} dicts inline"
+      ],
+      "recommendation": "Introduce KeywordEntry = TypedDict('KeywordEntry', {'term': str, 'tfidf': float}) (or a frozen dataclass) and change top_keywords to list[KeywordEntry]. Re-use EntityMention (already frozen dataclass) or a TypedDict alias for the entities field. Both have a known schema — lean into it."
+    },
+    {
+      "id": "KP-002",
+      "severity": "P1",
+      "confidence": 0.90,
+      "pre_existing": false,
+      "file": "src/chunking/schema.py",
+      "lines": "56-59",
+      "title": "AnalyzerConfig.strict_match / compat_match / tfidf typed as dict[str, Any] — known sub-keys go untracked",
+      "summary": "The plan spec (and every real use in analyzer.py) writes a well-defined set of keys into strict_match (model_name, split_mode, pos_allowlist, stopwords, lemma_rules, sudachidict_binary_sha256, normalization) and compat_match (ginza, spacy, sudachipy, sudachidict_package, sudachidict_package_version). Typing these as dict[str, Any] means the entire verify / diff path in load_and_verify accesses keys without any static guarantee.",
+      "why_it_matters": "analyzer.json is the first of the two stable output contracts. AnalyzerConfig is both read (from_dict) and written (to_dict); sloppy Any types here make it impossible for mypy to catch refactors that silently rename a key.",
+      "evidence": [
+        "schema.py:56-59: strict_match/compat_match/tfidf all dict[str, Any]",
+        "analyzer.py:194-215: builds dicts with 8 and 5 known keys respectively",
+        "analyzer.py:237-243: _strict_diff iterates these dicts — no static check"
+      ],
+      "recommendation": "Define StrictMatchDict and CompatMatchDict as TypedDict classes (total=True) with all plan-spec keys typed. Wire them into AnalyzerConfig. _strict_diff becomes statically safe."
+    },
+    {
+      "id": "KP-003",
+      "severity": "P1",
+      "confidence": 0.88,
+      "pre_existing": false,
+      "file": "src/chunking/wiki.py",
+      "lines": "59",
+      "title": "EntityStatus typed as plain str alias instead of Literal",
+      "summary": "EntityStatus = str is used as the type for ManifestEntry.status, but only three values are valid: 'success', 'failed', 'budget_skipped'. The entire cache-skip logic (_should_skip_due_to_cache) branches on these string literals, and the lint module's _load_success_entries also filters by 'success'. A typo in any future status assignment silently passes the type checker.",
+      "why_it_matters": "This is a closed enumeration used in multiple branch conditions. Literal['success', 'failed', 'budget_skipped'] or an IntEnum would make exhaustiveness checkable and prevent silent semantic bugs.",
+      "evidence": [
+        "wiki.py:59: EntityStatus = str",
+        "wiki.py:483-490: _should_skip_due_to_cache branches on prior.status == 'success' / 'failed' / 'budget_skipped'",
+        "lint.py:265: e.get('status') == 'success'"
+      ],
+      "recommendation": "Replace EntityStatus = str with EntityStatus = Literal['success', 'failed', 'budget_skipped']. ManifestEntry.status: EntityStatus. Add a final else: assert_never(prior.status) guard in _should_skip_due_to_cache."
+    },
+    {
+      "id": "KP-004",
+      "severity": "P1",
+      "confidence": 0.85,
+      "pre_existing": false,
+      "file": "src/chunking/ingest.py",
+      "lines": "278-284",
+      "title": "Broad except Exception in IngestRunner.run swallows every unhandled error into exit_code=10",
+      "summary": "The outermost try/except in IngestRunner.run catches all Exception subclasses including KeyboardInterrupt's non-Exception siblings, converts them to exit_code=10, logs via logger.exception, and silently deletes the staging directory. This means any programming error (AttributeError, TypeError) inside the pipeline looks identical to a data-integrity problem at the call site. The caller (run_ingest) sees only a string error message.",
+      "why_it_matters": "Regression risk: a bug introduced in any of the 10 pipeline steps (chunking, TF-IDF, NER, wiki) will be silently converted to exit_code=10 instead of surfacing as a traceback. In tests, this means a broken refactor passes silently unless the test explicitly checks result.errors content.",
+      "evidence": [
+        "ingest.py:278: except Exception as e:",
+        "ingest.py:279: logger.exception('ingest failed')",
+        "ingest.py:280-284: sets exit_code=10, appends to errors, rmtree staging"
+      ],
+      "recommendation": "Narrow the except to a specific set of recoverable exceptions (OSError, json.JSONDecodeError, etc.). Re-raise BaseException subclasses. At minimum, re-raise in tests by not catching RuntimeError (which is what test_smoke.py injects via _FailingChunker)."
+    },
+    {
+      "id": "KP-005",
+      "severity": "P1",
+      "confidence": 0.82,
+      "pre_existing": false,
+      "file": "src/chunking/query.py",
+      "lines": "37-44",
+      "title": "run_query_impl has untyped analyzer_factory parameter",
+      "summary": "The public function run_query_impl takes analyzer_factory with no type annotation (defaults to None, then falls back to default_analyzer_factory via import). The parameter is used on line 66 as a callable. Any caller passing a non-callable or wrong-signatured factory will only fail at runtime.",
+      "why_it_matters": "run_query_impl is a public, testable pure function. Its signature is the stable API surface for testing. Missing annotation obscures the AnalyzerFactory callable shape that is already defined in ingest.py.",
+      "evidence": [
+        "query.py:42: analyzer_factory=None — no type annotation"
+      ],
+      "recommendation": "Import AnalyzerFactory from ingest (or move the type alias to a shared location) and annotate: analyzer_factory: AnalyzerFactory | None = None."
+    },
+    {
+      "id": "KP-006",
+      "severity": "P1",
+      "confidence": 0.82,
+      "pre_existing": false,
+      "file": "src/chunking/ingest.py",
+      "lines": "296-303",
+      "title": "_ginza_model_version uses Any parameter and a bare except",
+      "summary": "_ginza_model_version(analyzer: Any) has a bare `except Exception: return 'unknown'` body. This swallows all errors from analyzer.build_config() silently. The resulting 'unknown' string then appears in analyzer_json_hash computation and manifest, making incremental wiki cache unreliable. The Any annotation also means the function accepts anything.",
+      "why_it_matters": "A misconfigured analyzer would silently degrade the source_hash correctness without surfacing any diagnostic, causing wiki pages to never be regenerated when they should be.",
+      "evidence": [
+        "ingest.py:296: def _ginza_model_version(analyzer: Any) -> str:",
+        "ingest.py:302-303: except Exception: return 'unknown'"
+      ],
+      "recommendation": "Accept IngestAnalyzer protocol type. Log a warning on exception instead of silently returning 'unknown'. Consider raising if the version cannot be determined during ingest."
+    },
+    {
+      "id": "KP-007",
+      "severity": "P2",
+      "confidence": 0.80,
+      "pre_existing": false,
+      "file": "src/chunking/ingest.py",
+      "lines": "374-375",
+      "title": "_append_log_md parameter agg_stats is untyped",
+      "summary": "_append_log_md accepts agg_stats without a type annotation. The actual type is AggregationStats from ner.py. This is particularly notable because all other parameters in the same function are typed. The caller passes the return value from aggregate_entities directly.",
+      "why_it_matters": "Minor but direct violation of the 'public code paths fully typed' bar. The type is concrete and available.",
+      "evidence": [
+        "ingest.py:374: def _append_log_md(path: Path, *, ..., agg_stats, ...) -> None:"
+      ],
+      "recommendation": "Add import of AggregationStats from chunking.ner and annotate: agg_stats: AggregationStats."
+    },
+    {
+      "id": "KP-008",
+      "severity": "P2",
+      "confidence": 0.80,
+      "pre_existing": false,
+      "file": "src/chunking/tfidf.py",
+      "lines": "158-179",
+      "title": "rebuild_vectorizer uses dummy corpus fit to inject IDF — fragile sklearn internal override",
+      "summary": "rebuild_vectorizer fits TfidfVectorizer on a dummy corpus (' '.join(vocabulary.keys())) and then overwrites vectorizer.idf_ directly. This relies on sklearn's undocumented internal attribute assignment being stable across minor versions. If sklearn changes the idf_ attribute name or validation, the override silently breaks cosine similarity at query time.",
+      "why_it_matters": "sklearn >= 1.4 is pinned (no upper bound). Patching internal attributes like _tfidf.idf_ across sklearn versions is a known brittleness. The alternative — constructing TfidfTransformer with fixed IDF — is the documented approach.",
+      "evidence": [
+        "tfidf.py:176: vectorizer.fit([' '.join(vocabulary.keys())])",
+        "tfidf.py:178-179: comment admits the internal override: '# scikit-learn の内部で _tfidf.idf_ を使うので上書き' then: vectorizer.idf_ = idf"
+      ],
+      "recommendation": "Use sklearn's documented path: after fitting, avoid overwriting idf_. Alternatively, use TfidfVectorizer(vocabulary=vocabulary) then call transform without fitting, using a pre-built TfidfTransformer that is serialized with its own idf_ from training. Or gate on sklearn.__version__ in tests."
+    },
+    {
+      "id": "KP-009",
+      "severity": "P2",
+      "confidence": 0.78,
+      "pre_existing": false,
+      "file": "src/chunking/wiki.py",
+      "lines": "452-454",
+      "title": "Broad except Exception in _preflight catches programming errors as LLMPreflightError",
+      "summary": "The pre-flight block wraps self._llm.generate(...) in `except Exception as e: raise LLMPreflightError(...)`. This means any AttributeError, TypeError, or import error inside generate() is re-raised as LLMPreflightError, causing ingest to abort with a misleading error message instead of a traceback.",
+      "why_it_matters": "Pre-flight failure causes immediate ingest abort. Masking a code bug as a network/API error makes diagnosis much harder and could waste an entire corpus processing run.",
+      "evidence": [
+        "wiki.py:453: except Exception as e:",
+        "wiki.py:454: raise LLMPreflightError(f'pre-flight failed: {e}') from e"
+      ],
+      "recommendation": "Narrow the except to LLMError (or LLMRetryableError | LLMPermanentError). Let unexpected exceptions propagate as-is."
+    },
+    {
+      "id": "KP-010",
+      "severity": "P2",
+      "confidence": 0.76,
+      "pre_existing": false,
+      "file": "src/chunking/ner.py",
+      "lines": "107-112",
+      "title": "aggregate_entities uses defaultdict with dict[str, Any] accumulator instead of a typed dataclass",
+      "summary": "per_key accumulates {'mentions': int, 'chunk_ids': set, 'cooccurring': set} as dict[str, Any], requiring multiple type: ignore comments (lines 107, 112) and a runtime cast. This is a classic case where a small dataclass or NamedTuple accumulator would eliminate the noise.",
+      "why_it_matters": "The type: ignore suppressions are a smell: they indicate the type system has been given up on for core aggregation logic. An incorrect key access (e.g. 'mention' vs 'mentions') would only fail at runtime.",
+      "evidence": [
+        "ner.py:91-93: per_key: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {'mentions': 0, 'chunk_ids': set(), 'cooccurring': set()})",
+        "ner.py:107: # type: ignore[assignment]",
+        "ner.py:112: # type: ignore[union-attr]"
+      ],
+      "recommendation": "Define a small @dataclass class _EntityAccum(mentions: int, chunk_ids: set[str], cooccurring: set[tuple[str, str]]) and use that as the defaultdict value type. The type: ignore comments disappear and the logic becomes self-documenting."
+    },
+    {
+      "id": "KP-011",
+      "severity": "P2",
+      "confidence": 0.75,
+      "pre_existing": false,
+      "file": "src/chunking/ingest.py",
+      "lines": "417",
+      "title": "_NoopLLM.generate has no return type annotation",
+      "summary": "_NoopLLM.generate(self, prompt: str, max_tokens: int) has no return type annotation. It always raises, so the annotation would be NoReturn, which is both correct and signals intent clearly.",
+      "why_it_matters": "Minor but the class is part of the LLMClient Protocol contract, which declares -> GenerateResult. The Protocol check passes only because Protocol matching is structural, but the missing annotation is misleading about the return type.",
+      "evidence": [
+        "ingest.py:417: def generate(self, prompt: str, max_tokens: int):  # pragma: no cover"
+      ],
+      "recommendation": "Annotate as -> GenerateResult (even though unreachable) or -> NoReturn to be explicit."
+    },
+    {
+      "id": "KP-012",
+      "severity": "P2",
+      "confidence": 0.74,
+      "pre_existing": false,
+      "file": "src/chunking/analyzer.py",
+      "lines": "110",
+      "title": "Broad except Exception in _verify_ne_extension hides Ginza pipeline failures",
+      "summary": "_verify_ne_extension wraps nlp('確認用。') in `except Exception as exc: raise AnalyzerNEUnavailableError(...)`. The intent is to catch Ginza pipeline initialization failures, but a programming error in the verification method itself would be converted into the same user-facing error.",
+      "why_it_matters": "Moderate: the scope is limited and the pragma: no cover tag suggests this is environment-only code. Still, the anti-pattern propagates across the codebase.",
+      "evidence": [
+        "analyzer.py:110: except Exception as exc:  # pragma: no cover"
+      ],
+      "recommendation": "Narrow to spacy.errors.Error or ImportError which Ginza is likely to raise; let unexpected exceptions propagate."
+    },
+    {
+      "id": "KP-013",
+      "severity": "P2",
+      "confidence": 0.72,
+      "pre_existing": false,
+      "file": "pyproject.toml",
+      "lines": "17",
+      "title": "Direct URL dependency on ja-ginza-electra wheel from GitHub without hash pinning",
+      "summary": "The ja-ginza-electra wheel is installed from a GitHub release URL without a sha256 hash (PEP 508 / pip --require-hashes). The URL points to a mutable GitHub releases asset that could be replaced. Additionally there is no upper bound on numpy, which has repeatedly broken API compatibility across major versions (1.x -> 2.x).",
+      "why_it_matters": "Security: mutable URL dependencies can deliver arbitrary code. Reproducibility: numpy without an upper bound (<2) will eventually pull 2.x which has breaking changes in array API that affect scipy sparse and sklearn.",
+      "evidence": [
+        "pyproject.toml:17: ja-ginza-electra @ https://github.com/megagonlabs/ginza/releases/download/v5.2.0/ja_ginza_electra-5.2.0-py3-none-any.whl",
+        "pyproject.toml:22: numpy (no bounds)"
+      ],
+      "recommendation": "Add a sha256 fragment: ... .whl#sha256=<hash>. Add numpy<2 until the codebase is tested against NumPy 2.x."
+    },
+    {
+      "id": "KP-014",
+      "severity": "P2",
+      "confidence": 0.70,
+      "pre_existing": false,
+      "file": "tests/test_smoke.py",
+      "lines": "60-63",
+      "title": "__import__ calls inside test fixture instead of normal imports",
+      "summary": "_ingest_fixture uses __import__('chunking.schema', fromlist=['EntityMention']) inline inside a dict literal. This is the anti-pattern for dynamic imports: it makes the intent unclear and prevents IDEs and type checkers from resolving the symbol. It also produces a confusing failure message if the import path changes.",
+      "why_it_matters": "Test quality bar: fixtures should be readable without executing them mentally. The direct import form from chunking.schema import EntityMention is always available since there is no conditional.",
+      "evidence": [
+        "test_smoke.py:60-63: __import__('chunking.schema', fromlist=['EntityMention']).EntityMention(...) three times"
+      ],
+      "recommendation": "Move the import to the top of the function or the module level: from chunking.schema import EntityMention."
+    },
+    {
+      "id": "KP-015",
+      "severity": "P2",
+      "confidence": 0.68,
+      "pre_existing": false,
+      "file": "src/chunking/ingest.py",
+      "lines": "42-53",
+      "title": "IngestAnalyzer.iter_entities returns Iterable[Any] instead of Iterable[EntityMention]",
+      "summary": "The IngestAnalyzer Protocol declares iter_entities as returning Iterable[Any]. The real implementation returns Iterable[EntityMention] and the callers in extract_entities_per_chunk (ner.py:55) call .ner_label on the yielded items. Typing the Protocol return as Any defeats Protocol structural checking for this method.",
+      "why_it_matters": "The Protocol is used as the test boundary, but the Any return type means a stub returning integers would satisfy it. The actual constraint (EntityMention with .name and .ner_label) goes unchecked.",
+      "evidence": [
+        "ingest.py:51: def iter_entities(self, text: str) -> Iterable[Any]: ...",
+        "ner.py:55: m.ner_label — relies on EntityMention shape"
+      ],
+      "recommendation": "Change to Iterable[EntityMention] in the Protocol definition."
+    },
+    {
+      "id": "KP-016",
+      "severity": "P3",
+      "confidence": 0.65,
+      "pre_existing": false,
+      "file": "src/chunking/lint.py",
+      "lines": "228-237",
+      "title": "_detect_degenerate_rows iterates rows in a Python loop — O(N) getrow calls on sparse matrix",
+      "summary": "_detect_degenerate_rows calls matrix.getrow(i) in a Python-level for loop over all rows. For a large corpus (thousands of chunks) this is slow due to per-row sparse slice construction. The same information is available via vectorized operations on matrix.data / matrix.indptr.",
+      "why_it_matters": "Performance: for the pairwise_threshold default of 2000 rows this is noticeable. The L2 norm check can be done via np.sqrt(np.array(matrix.power(2).sum(axis=1)).flatten()).",
+      "evidence": [
+        "lint.py:228: for i in range(matrix.shape[0]): row = matrix.getrow(i)"
+      ],
+      "recommendation": "Replace with vectorized: nnz_per_row = np.diff(matrix.indptr); norms = np.sqrt(np.array(matrix.power(2).sum(axis=1)).flatten()); degenerate = set(np.where((nnz_per_row < nnz_threshold) | (norms < l2_threshold))[0])."
+    },
+    {
+      "id": "KP-017",
+      "severity": "P3",
+      "confidence": 0.63,
+      "pre_existing": false,
+      "file": "src/chunking/wiki.py",
+      "lines": "385-386",
+      "title": "Budget consumed calculation double-counts preflight on every loop iteration",
+      "summary": "On every loop iteration, budget_consumed = stats.preflight_called + stats.attempted is recomputed. stats.preflight_called is a bool (1 when True, 0 when False), so budget_consumed == 1 + stats.attempted for the entire loop body after the first entity. This is the intended semantics (pre-flight counts as 1 LLM call), but using a bool as an integer addend is implicit and surprising — a future reader may change preflight_called to an int count (e.g. if pre-flight retries are added) and break the logic.",
+      "why_it_matters": "Minor clarity issue: the intent (pre-flight occupies 1 budget slot) is not explicit. Adding a dedicated preflight_calls: int = 0 field to WikiStats makes the arithmetic self-documenting.",
+      "evidence": [
+        "wiki.py:385: budget_consumed = stats.preflight_called + stats.attempted"
+      ],
+      "recommendation": "Add preflight_calls: int = 0 to WikiStats, increment it in generate_all after preflight succeeds, and use preflight_calls in the budget calculation."
+    }
+  ],
+  "residual_risks": [
+    {
+      "id": "RR-KP-001",
+      "description": "The tfidf.py rebuild_vectorizer writes to vectorizer.idf_ directly. If sklearn >= 1.6 adds a setter guard on idf_ (or renames it), cosine similarity will silently degrade to all-zeros at query time. There is no test that verifies the rebuilt vectorizer produces numerically equivalent scores to a fit-from-scratch vectorizer on the same corpus.",
+      "files": ["src/chunking/tfidf.py"]
+    },
+    {
+      "id": "RR-KP-002",
+      "description": "ManifestEntry.__init__ (via @dataclass) takes **raw from the JSON dict on load (wiki.py:188: ManifestEntry(**raw)). If a future version of ManifestEntry adds a new required field, loading an old manifest.json will raise TypeError at runtime rather than being handled gracefully. There is no migration path.",
+      "files": ["src/chunking/wiki.py"]
+    },
+    {
+      "id": "RR-KP-003",
+      "description": "The staging-to-target atomic swap in _atomic_swap falls back to shutil.copytree on cross-device rename failure (OSError). During the copy phase a power failure leaves a partially-written target with no backup if the backup rename already succeeded. This is documented as best-effort but is worth tracking.",
+      "files": ["src/chunking/ingest.py"]
+    }
+  ],
+  "testing_gaps": [
+    {
+      "id": "TG-KP-001",
+      "description": "There is no test that verifies the numerical correctness of query cosine scores. Tests assert result.hits is non-empty and top text contains keywords, but do not verify that scores are correctly ordered or numerically match a reference computation. A bug in rebuild_vectorizer's IDF injection would not be caught.",
+      "files": ["tests/test_query.py", "tests/test_tfidf.py"]
+    },
+    {
+      "id": "TG-KP-002",
+      "description": "_detect_duplicates in lint.py has no dedicated test. The pairwise skip path is tested, but the detection logic itself (cosine > 0.95 pair) is never exercised by the test suite.",
+      "files": ["tests/test_lint.py"]
+    },
+    {
+      "id": "TG-KP-003",
+      "description": "The sanitize_entity_filename long-name truncation test (test_sanitize_entity_filename_long_name_gets_hash) checks <= 128 + 3 bytes including .md. The boundary condition for the hash suffix concatenation is not separately tested — the prefix truncation in ner.py:159 (decode with errors='ignore') could silently drop multibyte character boundaries.",
+      "files": ["tests/test_ner.py", "src/chunking/ner.py"]
+    },
+    {
+      "id": "TG-KP-004",
+      "description": "There is no test for _append_log_md file creation on the first vs append run (the 'header = ... if not path.exists() else \"\"' branch in ingest.py:376). The second-run append path is exercised indirectly but never asserted.",
+      "files": ["tests/test_ingest.py", "src/chunking/ingest.py"]
+    }
+  ]
+}

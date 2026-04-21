@@ -1,0 +1,21 @@
+{
+  "run_id": "20260421-180230-0bd40c95",
+  "branch": "main",
+  "head_sha": "f16a265",
+  "base": "bf11cf8",
+  "scope": "full-audit (entire working tree vs. root commit)",
+  "mode": "interactive",
+  "routing_option": "B (LFG)",
+  "reviewers_dispatched": 13,
+  "reviewers_returned_structured": 11,
+  "reviewers_returned_unstructured": 2,
+  "findings_total": 63,
+  "findings_applied": 43,
+  "findings_skipped_needs_decision": 15,
+  "findings_acknowledged_advisory": 5,
+  "files_changed": 23,
+  "lines_changed": "+741 / -174",
+  "pytest_result": "115 passed, 10 skipped (gated), exit 0",
+  "verdict": "Ready with fixes — pre-LFG P0 + RCE + contract violations resolved; 15 findings deliberately skipped as needing dedicated decisions",
+  "completed_at": "2026-04-21T18:45:00Z"
+}
