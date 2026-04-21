@@ -42,7 +42,7 @@ class TfidfBuilder:
         *,
         top_keywords: int = 10,
         min_df: int | float = 1,
-        max_df: int | float = 0.95,
+        max_df: int | float = 1.0,
         sublinear_tf: bool = True,
     ) -> None:
         self._analyzer = analyzer
