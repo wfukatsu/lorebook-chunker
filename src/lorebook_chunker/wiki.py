@@ -14,8 +14,10 @@ import logging
 import os
 import random
 import tempfile
+import threading
 import time
 import re
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,7 +33,6 @@ from lorebook_chunker.llm import (
     LLMRetryableError,
 )
 from lorebook_chunker.ner import sanitize_entity_filename
-from lorebook_chunker.normalize import normalize_text
 from lorebook_chunker.schema import ChunkRecord, EntityAggregate
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,11 @@ DEFAULT_RETRY_ATTEMPTS = 3
 SYSTEMIC_FAILURE_MIN_ATTEMPTS = 5
 SYSTEMIC_FAILURE_RATIO = 0.5
 MANIFEST_CHECKPOINT_INTERVAL = 5
+# エンティティプロンプトに含めるチャンク上限.
+# 頻出エンティティ (100+ チャンクに出現) のプロンプトを無制限に積むと入力トークンが
+# 爆発する. 先頭 N チャンクに絞ることで上限をかけつつ、`EntityAggregate.chunk_ids`
+# は登場順でソート済みなので情報量は冒頭に集中する.
+DEFAULT_PROMPT_CHUNK_CAP = 20
 
 EntityStatus = Literal["success", "failed", "budget_skipped"]
 
@@ -77,10 +83,15 @@ def _canonical_json_hash(payload: Any) -> str:
 
 
 def _normalize_chunks_for_hash(chunks: Sequence[ChunkRecord], entity_chunk_ids: set[str]) -> str:
-    """エンティティが出現するチャンクの正規化テキストを chunk_id 昇順で sorted 連結."""
+    """エンティティが出現するチャンクテキストを chunk_id 昇順で sorted 連結.
+
+    ChunkRecord.text はすでに ingest 側で ``normalize_text`` 済み (chunker は
+    正規化後テキストから切り出すのみ) なので、ここで再正規化しても冪等な no-op になる.
+    純粋関数の高速化のため再正規化を省略する.
+    """
     picked = [c for c in chunks if c.chunk_id in entity_chunk_ids]
     picked.sort(key=lambda c: c.chunk_id)
-    return "\n---\n".join(normalize_text(c.text) for c in picked)
+    return "\n---\n".join(c.text for c in picked)
 
 
 def compute_source_hash(
@@ -339,6 +350,15 @@ class WikiGeneratorConfig:
     force_regenerate: bool = False
     retry_failed: bool = False
     ai_verification_status: str = "unverified"
+    # parallelism=1 (default) でシリアル実行. >1 で ThreadPoolExecutor を使い
+    # I/O-bound な LLM 呼び出しを同時投入する.
+    # - Anthropic: 5〜10 が目安 (公式 concurrency limit 内)
+    # - Ollama: OLLAMA_NUM_PARALLEL と揃える (通常 3〜4, M2 Pro 32GB qwen3:8b なら 3)
+    parallelism: int = 1
+    # LLM プロンプトに載せるチャンク上限. None で無制限. 既定は DEFAULT_PROMPT_CHUNK_CAP.
+    prompt_chunk_cap: int | None = DEFAULT_PROMPT_CHUNK_CAP
+    # progress レポーター (任意). IngestRunner 側で注入.
+    progress: Any = None
 
 
 class WikiGenerator:
@@ -365,6 +385,9 @@ class WikiGenerator:
         self._manifest = ManifestStore(config.manifest_path)
         self._sleep = sleep
         self._rng = rng or random.Random(42)
+        # parallel 実行時の manifest / page 書き込み排他. parallelism=1 でもロック取得
+        # 自体のコストは無視できるので常時使う.
+        self._write_lock = threading.Lock()
 
     def generate_all(self, entities: Sequence[EntityAggregate]) -> WikiStats:
         stats = WikiStats(llm_model_id=self._llm.model_id)
@@ -395,19 +418,11 @@ class WikiGenerator:
             key=lambda e: (-e.mention_count, -e.chunk_count, e.name),
         )
 
-        # ループ
-        attempts_completed = 0
-        for i, agg in enumerate(ordered, start=1):
-            # F-003: budget はエンティティ試行数のみでカウント.
-            # pre-flight は別カウンタ (stats.preflight_calls) で記録し、
-            # --max-llm-calls の budget からは外す.
-            budget_consumed = stats.attempted
-            if self._config.max_llm_calls is not None and budget_consumed >= self._config.max_llm_calls:
-                # budget_skipped として記録
-                self._record_budget_skip(agg)
-                stats.budget_skipped += 1
-                continue
-
+        # まず cache/budget で処理できるものを sync に捌いてから、残りを LLM に投げる.
+        # 残り (= 実際に LLM 呼び出しが発生する) だけを submit することで、budget と
+        # skipped_cached は parallelism 有無に関係なく deterministic に決まる.
+        to_submit: list[tuple[EntityAggregate, str]] = []
+        for agg in ordered:
             key = f"{agg.ner_label}__{agg.name}"
             source_hash = compute_source_hash(
                 entity_name=agg.name,
@@ -422,10 +437,140 @@ class WikiGenerator:
             if self._should_skip_due_to_cache(prior, source_hash):
                 stats.skipped_cached += 1
                 continue
+            # F-003: budget はエンティティ試行数のみでカウント.
+            # pre-flight は別カウンタ (stats.preflight_calls) で記録し、
+            # --max-llm-calls の budget からは外す.
+            if (
+                self._config.max_llm_calls is not None
+                and len(to_submit) >= self._config.max_llm_calls
+            ):
+                self._record_budget_skip(agg)
+                stats.budget_skipped += 1
+                continue
+            to_submit.append((agg, source_hash))
 
-            # ここから試行
+        parallelism = max(1, int(self._config.parallelism or 1))
+        progress = self._config.progress
+        if progress is not None and to_submit:
+            progress.start(
+                f"wiki 生成 (LLM 呼出 parallelism={parallelism})", total=len(to_submit)
+            )
+
+        try:
+            if parallelism == 1:
+                self._run_serial(to_submit, stats)
+            else:
+                self._run_parallel(to_submit, stats, parallelism)
+        finally:
+            if progress is not None and to_submit:
+                progress.end()
+
+        # 最終 manifest 書き出し
+        self._manifest.save(
+            ginza_model=self._ginza_model_version, llm_model=self._llm.model_id
+        )
+        return stats
+
+    # ---- serial / parallel entity loops ------------------------------
+
+    def _run_serial(
+        self,
+        to_submit: list[tuple[EntityAggregate, str]],
+        stats: WikiStats,
+    ) -> None:
+        """parallelism=1 用の逐次ループ (旧挙動をそのまま保つ).
+
+        systemic abort / checkpoint / 成功失敗記録の契約はこのパスが基準.
+        """
+        progress = self._config.progress
+        attempts_completed = 0
+        for agg, source_hash in to_submit:
             stats.attempted += 1
             result = self._generate_for_entity(agg)
+            self._apply_result(agg, source_hash, result, stats)
+            attempts_completed += 1
+            if progress is not None:
+                progress.tick()
+            if attempts_completed % MANIFEST_CHECKPOINT_INTERVAL == 0:
+                self._manifest.save(
+                    ginza_model=self._ginza_model_version, llm_model=self._llm.model_id
+                )
+            if self._should_abort_systemic(stats):
+                self._handle_systemic_abort(stats)
+
+    def _run_parallel(
+        self,
+        to_submit: list[tuple[EntityAggregate, str]],
+        stats: WikiStats,
+        parallelism: int,
+    ) -> None:
+        """ThreadPoolExecutor を使った同時 LLM 呼び出し.
+
+        - budget / cache は pre-compute (to_submit) で確定済み.
+        - 完了ごとに manifest checkpoint + systemic abort を判定し、検知したら
+          pool を shutdown(cancel_futures=True) して LLMPermanentError を raise.
+        - 完了順は確定しないが manifest への書き込みは内部ロックで直列化されるため
+          出力 .md / manifest.json は決定論.
+        """
+        progress = self._config.progress
+        attempts_completed = 0
+        pool = ThreadPoolExecutor(
+            max_workers=parallelism, thread_name_prefix="wiki-llm"
+        )
+        # submit 前に attempted を加算しておくと systemic check が
+        # "in-flight で投入済みだが未完了" のものも含めてしまう.
+        # attempted は完了ごとに加算する (逐次版と意味を合わせる).
+        futures: dict[Future[GenerateResult | None], tuple[EntityAggregate, str]] = {}
+        try:
+            for agg, source_hash in to_submit:
+                fut = pool.submit(self._generate_for_entity, agg)
+                futures[fut] = (agg, source_hash)
+            # as_completed の代わりに毎回スキャンする: systemic abort 時に
+            # cancel_futures=True で shutdown してから loop を抜けるため.
+            from concurrent.futures import as_completed
+
+            for fut in as_completed(futures):
+                agg, source_hash = futures[fut]
+                try:
+                    result = fut.result()
+                except BaseException as e:  # pragma: no cover - defensive
+                    logger.exception("unexpected exception from wiki worker: %s", e)
+                    result = None
+                stats.attempted += 1
+                self._apply_result(agg, source_hash, result, stats)
+                attempts_completed += 1
+                if progress is not None:
+                    progress.tick()
+                if attempts_completed % MANIFEST_CHECKPOINT_INTERVAL == 0:
+                    self._manifest.save(
+                        ginza_model=self._ginza_model_version,
+                        llm_model=self._llm.model_id,
+                    )
+                if self._should_abort_systemic(stats):
+                    # 未完了は budget_skipped 相当として記録.
+                    # (source_hash 未確定なので record_budget_skip の既存 prior からの抽出を使う.)
+                    for pending, (pend_agg, _pend_hash) in list(futures.items()):
+                        if not pending.done():
+                            pending.cancel()
+                    self._handle_systemic_abort(stats)
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    # ---- shared helpers for serial/parallel --------------------------
+
+    def _apply_result(
+        self,
+        agg: EntityAggregate,
+        source_hash: str,
+        result: GenerateResult | None,
+        stats: WikiStats,
+    ) -> None:
+        """LLM 呼び出し結果を stats と manifest/page に反映 (シリアル/並列で共通).
+
+        manifest/page 書き込みは `self._write_lock` で直列化し、parallel 実行時も
+        出力ファイルは決定論的に置かれることを保証する.
+        """
+        with self._write_lock:
             if result is None:
                 stats.failed += 1
                 self._record_failure(agg, source_hash, reason="retries exhausted")
@@ -435,29 +580,16 @@ class WikiGenerator:
                 stats.total_output_tokens += result.output_tokens
                 self._record_success(agg, source_hash, result)
 
-            attempts_completed += 1
-            # checkpoint
-            if attempts_completed % MANIFEST_CHECKPOINT_INTERVAL == 0:
-                self._manifest.save(
-                    ginza_model=self._ginza_model_version, llm_model=self._llm.model_id
-                )
-
-            # systemic failure check
-            if self._should_abort_systemic(stats):
-                stats.systemic_failure_aborted = True
-                self._manifest.save(
-                    ginza_model=self._ginza_model_version, llm_model=self._llm.model_id
-                )
-                raise LLMPermanentError(
-                    f"systemic failure detected: {stats.failed}/{stats.attempted} "
-                    "entities failed (> 50%). aborting ingest."
-                )
-
-        # 最終 manifest 書き出し
+    def _handle_systemic_abort(self, stats: WikiStats) -> None:
+        """F-015 systemic failure abort: manifest を退避保存してから raise."""
+        stats.systemic_failure_aborted = True
         self._manifest.save(
             ginza_model=self._ginza_model_version, llm_model=self._llm.model_id
         )
-        return stats
+        raise LLMPermanentError(
+            f"systemic failure detected: {stats.failed}/{stats.attempted} "
+            "entities failed (> 50%). aborting ingest."
+        )
 
     # ---- pre-flight --------------------------------------------------
 
@@ -546,12 +678,18 @@ class WikiGenerator:
         return base + jitter
 
     def _build_entity_prompt(self, agg: EntityAggregate) -> str:
+        cap = self._config.prompt_chunk_cap
+        chunk_ids = agg.chunk_ids if cap is None else agg.chunk_ids[: max(1, int(cap))]
         pieces: list[str] = []
-        for cid in agg.chunk_ids:
+        for cid in chunk_ids:
             chunk = self._chunks_by_id.get(cid)
             if chunk is None:
                 continue
             pieces.append(f"- [{chunk.source}] {chunk.text}")
+        if cap is not None and len(agg.chunk_ids) > len(chunk_ids):
+            pieces.append(
+                f"... (残り {len(agg.chunk_ids) - len(chunk_ids)} 件のチャンクは省略) ..."
+            )
         chunks_text = "\n".join(pieces)
         return PROMPT_TEMPLATE_V1.format(
             ner_label=agg.ner_label,

@@ -68,12 +68,51 @@ def _add_ingest(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     p.add_argument(
+        "--llm-parallelism",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "wiki 生成時の LLM 同時呼出数 (既定: anthropic=5, ollama=3). "
+            "Anthropic は公式 concurrency 制限内で 10 まで上げられる. "
+            "Ollama は OLLAMA_NUM_PARALLEL と揃える (7B モデル + 32GB なら 3 が目安). "
+            "1 を指定すると旧来のシリアル挙動になる."
+        ),
+    )
+    p.add_argument(
+        "--analyzer-backend",
+        choices=["electra", "ginza"],
+        default="electra",
+        help=(
+            "日本語 NLP バックエンド. 既定 electra (ja_ginza_electra, transformer). "
+            "ginza は transformer を持たない軽量モデル (ja_ginza) で CPU 推論が大幅に速い "
+            "(NER 粒度が若干違うので精度トレード). `pip install -e '.[fast]'` が必要."
+        ),
+    )
+    p.add_argument(
+        "--device",
+        choices=["cpu", "mps", "cuda"],
+        default="cpu",
+        help=(
+            "transformer 推論デバイス. 既定 cpu. mps は Apple Silicon の Metal で "
+            "ELECTRA を高速化 (--analyzer-backend electra のみ効果). "
+            "MPS 時は n_process が自動的に 1 に強制される (MPS コンテキストは "
+            "プロセス間共有できないため). 数値は CPU と bit-exact ではないので "
+            "POS/NER の境界で vocab/chunks が僅かに変わる可能性あり."
+        ),
+    )
+    p.add_argument(
         "--format",
         choices=["human", "json"],
         default="human",
         help="出力形式 (既定: human). json 指定時は summary が stdout に出る",
     )
-    p.add_argument("--quiet", action="store_true", help="identity banner と human success 行を抑止")
+    p.add_argument("--quiet", action="store_true", help="identity banner と human success 行を抑止 (進捗も抑止)")
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="stderr への進捗表示を抑止 (--quiet でも自動で off)",
+    )
 
 
 def _add_query(subparsers: argparse._SubParsersAction) -> None:

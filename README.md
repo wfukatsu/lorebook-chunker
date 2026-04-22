@@ -297,6 +297,17 @@ lorebook-chunker query out/ "合併の背景" --top-k 5
 lorebook-chunker lint out/
 ```
 
+### 速度を稼ぐには
+
+| 使い分け | 推奨設定 |
+|---|---|
+| Apple Silicon で ELECTRA を 2.9〜4.7x 速く (M1 Pro〜M1 Max) | `--device mps`。精度は CPU とほぼ同等だが bit-exact ではない点に注意 |
+| NER 精度よりスループット重視 | `pip install -e '.[fast]' && lorebook-chunker ingest ... --analyzer-backend ginza` で ELECTRA 非使用の軽量モデルに切替 (5〜10x 速い, NER 粒度がやや異なる) |
+| Anthropic で wiki を高速化 | 既定で 5 並列. `--llm-parallelism 10` まで上げられる (公式 concurrency limit 内) |
+| Ollama で wiki を並列化 | `OLLAMA_NUM_PARALLEL=3 ollama serve` を起動しておき、CLI 側は既定の 3 並列でそのまま使う |
+| LLM コスト最優先 (wiki をとにかく安く) | Anthropic の [Message Batches API](https://platform.claude.com/docs/en/build-with-claude/batch-processing) を使う外部ワークフロー (本 CLI 単体では現状サポートしていない) |
+| 開発ループで LLM だけ切り離したい | `--skip-wiki` — chunks.jsonl / vocab.npz / analyzer.json のみ生成 |
+
 ### `lorebook-chunker ingest`
 
 | フラグ | 既定 | 効果 |
@@ -307,6 +318,7 @@ lorebook-chunker lint out/
 | `--retry-failed` | off | 前回 `status=failed` / `budget_skipped` のみを再試行。`--force-regenerate` と同時指定時は force が優先され、retry は無視 + 警告。|
 | `--llm-backend {anthropic,ollama}` | `anthropic` | LLM バックエンド。`anthropic` は `ANTHROPIC_API_KEY` 必須。|
 | `--llm-model MODEL` | バックエンド既定 | 選択したバックエンドに渡すモデル名 (下表)。|
+| `--llm-parallelism N` | anthropic=5 / ollama=3 | wiki 生成時の LLM 同時呼出数。1 を指定すると旧シリアル挙動。Ollama 利用時は `OLLAMA_NUM_PARALLEL` と揃える。|
 | `--format {human,json}` | `human` | `json` 指定時は `IngestResult` サマリが stdout に出る (agent 連携用)。|
 | `--quiet` | off | identity banner と human success 行を抑止。|
 

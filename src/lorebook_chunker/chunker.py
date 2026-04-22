@@ -66,11 +66,20 @@ class Chunker:
         normalized_text: str,
         *,
         input_dir: str | None = None,
+        sentences: Iterable[str] | None = None,
     ) -> Iterator[ChunkRecord]:
-        """1 ドキュメントをチャンク列に変換."""
+        """1 ドキュメントをチャンク列に変換.
+
+        ``sentences`` を与えると `self._splitter` を呼ばずその配列を使う.
+        ingest 側で全ファイルを 1 回の `nlp.pipe(n_process>1)` に束ねて文境界を
+        並列計算するための fast-path 用引数.
+        """
         if not normalized_text:
             return
-        sentences = list(self._splitter(normalized_text))
+        if sentences is None:
+            sentences = list(self._splitter(normalized_text))
+        else:
+            sentences = list(sentences)
         if not sentences:
             return
         sentence_spans = self._locate_sentence_spans(normalized_text, sentences)

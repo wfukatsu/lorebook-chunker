@@ -20,6 +20,11 @@ from lorebook_chunker.schema import KeywordEntry
 AnalyzerCallable = Callable[[str], list[str]]
 
 
+def _identity_analyzer(tokens: list[str]) -> list[str]:
+    """pre-tokenized 入力用の恒等関数. モジュールトップレベルで定義し pickle 可能にしておく."""
+    return list(tokens)
+
+
 @dataclass
 class TfidfArtifacts:
     """vocab.npz の復元表現."""
@@ -67,6 +72,38 @@ class TfidfBuilder:
         )
         matrix = self._vectorizer.fit_transform(list(texts))
         # fit_transform の返り値型: scipy.sparse.csr_matrix
+        if not isinstance(matrix, csr_matrix):
+            matrix = csr_matrix(matrix)
+        vocabulary: dict[str, int] = dict(self._vectorizer.vocabulary_)
+        idf = np.asarray(self._vectorizer.idf_, dtype=np.float64)
+        return matrix, vocabulary, idf
+
+    def fit_transform_pretokenized(
+        self, tokens_per_chunk: Sequence[Sequence[str]]
+    ) -> tuple[csr_matrix, dict[str, int], np.ndarray]:
+        """事前トークナイズ済み入力の高速パス.
+
+        ingest 側で chunk ごとの Doc を 1 度だけ計算した後、そのトークン列を直接
+        投入するために使う. sklearn に identity analyzer を注入することで
+        TfidfVectorizer の analyzer(text) 経由の GiNZA 再呼び出しを完全に回避する.
+
+        返り値とスキーマは fit_transform と同一 (matrix, vocabulary, idf).
+        """
+        if not tokens_per_chunk:
+            raise ValueError("fit_transform_pretokenized: tokens_per_chunk must be non-empty")
+        # sklearn の analyzer 契約は callable(input) -> list[str]. 事前トークナイズ済みなら
+        # input はすでに list[str] なので恒等関数で流す. lowercase/stop_words の前処理も
+        # skip したいので analyzer ルートを使う (tokenizer=... は lowercase が噛む).
+        self._vectorizer = TfidfVectorizer(
+            analyzer=_identity_analyzer,
+            min_df=self.min_df,
+            max_df=self.max_df,
+            sublinear_tf=self.sublinear_tf,
+        )
+        # TfidfVectorizer は入力 iterable を 1 度だけ走査するので、
+        # 事前に全体を list に展開するコピーは冗長 (数 MB〜数十 MB の無駄).
+        # list[str] は identity_analyzer が pass-through するので Sequence のまま渡せる.
+        matrix = self._vectorizer.fit_transform(tokens_per_chunk)
         if not isinstance(matrix, csr_matrix):
             matrix = csr_matrix(matrix)
         vocabulary: dict[str, int] = dict(self._vectorizer.vocabulary_)
@@ -200,8 +237,12 @@ class TfidfBuilder:
             vocabulary=vocabulary,
         )
         # vocabulary を注入した後で idf を注入するため、空文書に対して一度 fit
-        # (TfidfVectorizer は vocabulary 指定で fit せず呼べないため dummy corpus で済ませる)
-        vectorizer.fit([" ".join(vocabulary.keys())])
+        # (TfidfVectorizer は vocabulary 指定で fit せず呼べないため dummy corpus で済ませる).
+        # 以前は " ".join(vocabulary.keys()) を渡していたが、大規模コーパスで語彙数が
+        # 数千を超えると analyzer (=GiNZA pipeline) が巨大文字列を parse して
+        # bunsetu_recognizer で RecursionError を起こした. idf_ は直後に上書きするため
+        # ダミーは空文書で良い.
+        vectorizer.fit([""])
         # scikit-learn の内部で _tfidf.idf_ を使うので上書き
         vectorizer.idf_ = idf
         return vectorizer

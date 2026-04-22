@@ -268,13 +268,46 @@ def _load_success_entries(manifest_path: Path) -> list[dict[str, Any]]:
 def _detect_similar_names(
     entries: list[dict[str, Any]], *, ratio: float
 ) -> list[tuple[str, str, float]]:
-    """表記近似検出. Levenshtein 比 > ratio のペアを返す (O(N^2))."""
+    """表記近似検出. Levenshtein 比 > ratio のペアを返す.
+
+    rapidfuzz が利用可能なら C++ 実装の ``fuzz.ratio`` + ``process.cdist`` で一括計算
+    (数千 entity で 10-50x 高速). 未 install なら stdlib の ``difflib.SequenceMatcher``
+    にフォールバックする. 結果は完全に同じ ratio ではない (アルゴリズム差) が、
+    実用上の「表記近似候補」検知には十分互換.
+    """
+    names_pairs = [
+        (f"{e.get('ner_label')}__{e.get('entity_name')}", e.get("entity_name", ""))
+        for e in entries
+    ]
+    if not names_pairs:
+        return []
+
+    try:
+        from rapidfuzz import fuzz as _rf_fuzz, process as _rf_process  # type: ignore[import-not-found]
+    except ImportError:
+        _rf_fuzz = None
+        _rf_process = None
+
     out: list[tuple[str, str, float]] = []
-    names = [(f"{e.get('ner_label')}__{e.get('entity_name')}", e.get("entity_name", "")) for e in entries]
-    for i in range(len(names)):
-        for j in range(i + 1, len(names)):
-            a_id, a_name = names[i]
-            b_id, b_name = names[j]
+    if _rf_fuzz is not None and _rf_process is not None:
+        ids = [p[0] for p in names_pairs]
+        names_only = [p[1] for p in names_pairs]
+        # cdist で N×N の類似度行列を 1 ショットで得る (rapidfuzz 側で対称性も活用).
+        # fuzz.ratio は 0-100 スケールなので 100 倍の threshold で比較.
+        scores = _rf_process.cdist(names_only, names_only, scorer=_rf_fuzz.ratio)
+        thr = ratio * 100.0
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                s = float(scores[i][j])
+                if s > thr:
+                    out.append((ids[i], ids[j], s / 100.0))
+        return out
+
+    # Fallback: difflib
+    for i in range(len(names_pairs)):
+        for j in range(i + 1, len(names_pairs)):
+            a_id, a_name = names_pairs[i]
+            b_id, b_name = names_pairs[j]
             r = difflib.SequenceMatcher(None, a_name, b_name).ratio()
             if r > ratio:
                 out.append((a_id, b_id, r))
