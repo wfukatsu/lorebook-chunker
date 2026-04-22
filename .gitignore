@@ -12,5 +12,23 @@ build/
 
 # Local ingest outputs
 out/
+out_*/
 *.npz
 .venv311/
+*.staging/
+*.backup/
+*.failed/
+
+# Tool / editor state
+.claude/
+.serena/
+.vscode/
+.idea/
+
+# Secrets
+.env
+.env.*
+*.env
+
+# Private input corpora (not for public distribution)
+test_optics/
