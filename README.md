@@ -14,62 +14,44 @@
 
 ---
 
+## 設計ハイライト
+
+日本語 RAG 前処理でつまずきやすい層 (分かち書き / POS / NER の再現性、破壊的再生成時の LLM コスト爆発、pipeline の途中失敗耐性) を以下の契約で押さえています。詳細は後述の各セクションに分散記載。
+
+- **単一パス ELECTRA** (`analyzer.analyze_documents`): 文境界 + TF-IDF lemma + 絶対 char offset 付き entity を 1 回の `nlp.pipe` で同時回収. 旧 2 パス実装比で **NLP 時間 -53.6%** (10 ファイルで 23.17s → 10.75s, commit ログ実測)。
+- **決定論と再現性**: `chunk_id` は `sha256(posix_path + char offset + text)` の先頭 12 桁で、破壊的全再生成後も同一入力なら同一 ID。`analyzer.json.strict_match` に Ginza モデル checksum / Sudachi 辞書 SHA-256 / 正規化契約を焼き込み、`query` / `lint` / 再 `ingest` で `AnalyzerVersionMismatchError` として fail-fast 検出。
+- **破壊的全再生成 + source_hash キャッシュ**: 毎回 `<output_dir>.staging/` で作り直して `os.replace` で atomic swap。差分 ingest はあえて提供せず、高コストな LLM 呼出だけを `source_hash`(entity テキスト + analyzer ハッシュ + prompt version) 一致でスキップ。運用モデルがシンプルで状態管理の罠が少ない。
+- **LLM 予算 / 信頼性**: pre-flight 1 call で疎通確認 (budget 外)、`LLMRetryableError` は 3 回 retry、failure ratio > 50% で systemic abort → `exit 6` + `.failed/` に manifest 退避。per-backend 既定並列度 (Anthropic 5 / Ollama 3) + `threading.Lock` 付き manifest write。
+- **観測可能性 / エージェント連携**: 各 phase を `ProgressReporter` で stderr 出力 (TTY は単一行更新 / 非 TTY は行追記)、`ingest_result.json` と `--format json` でサマリを stdout に、`log.md` に LLM トークン累計まで記録。`query` は OOV / ゼロヒットを `exit 4` で成功ゼロ件と区別。
+- **責務の絞り込み**: 本番検索は下流 vector store 前提。TF-IDF `query` は **コーパス整形時の確認用ベースライン** と identity banner に明記し、embedding / BM25 / vector DB 書き込みは対象外として `chunks.jsonl` のスキーマ安定性だけを契約にする。
+
+---
+
 ## アーキテクチャ
 
 ### データフロー (ingest)
 
-```
- input_dir/*.txt
-      │
-      ▼
- ┌──────────────────┐
- │ normalize_text   │  NFKC + LF-only + 末尾 strip + 連続空白 collapse + 全文 strip
- └──────────────────┘
-      │                                                               (正規化後テキスト)
-      ▼
- ┌──────────────────┐   Ginza ja_ginza_electra
- │ JapaneseAnalyzer │   ├─ iter_sentences         (spaCy sents)
- │ (spacy.load)     │   ├─ tokenize_for_tfidf     (Sudachi lemma, POS allowlist)
- └──────────────────┘   └─ iter_entities          (BIO walk over doc.ents)
-      │                                                       │
-      ├─ 文境界 + 文字数でチャンク生成                        │ 各チャンク text
-      ▼                                                       ▼
- ┌─────────────┐        ┌─────────────────────┐    ┌──────────────────┐
- │ JpChunker   │───▶───▶│ TfidfBuilder        │    │ aggregate_entities│
- │ target/over │        │ (TfidfVectorizer,   │    │ min_mentions / chu│
- │ lap/soft-   │ chunk  │  custom analyzer)   │    │ nks でフィルタ + │
- │ split       │ 列     │                     │    │ OntoNotes5 label  │
- └─────────────┘        └─────────────────────┘    └──────────────────┘
-      │                         │                          │
-      │   row_index はコーパス   │ top_keywords/chunk       │ EntityAggregate[]
-      │   全体で global 採番     │ + vocab_terms / idf     │
-      ▼                         ▼                          ▼
- ┌──────────────────────────────────────────────────────────────────┐
- │                           staging/ (*.staging)                    │
- │  chunks.jsonl  vocab.npz  analyzer.json                          │
- │  entities/<LABEL>__<name>_<sha6>.md  manifest.json  index.md     │
- │  log.md  ingest_result.json                                      │
- └──────────────────────────────────────────────────────────────────┘
-      │                                  ▲
-      │ wiki generation                  │ 既存 output の manifest.json を pre-populate
-      ▼                                  │ (source_hash 一致なら cache skip)
- ┌────────────────────────────┐          │
- │ WikiGenerator              │          │
- │  - pre-flight 1 call       │──────────┘
- │  - mention_count DESC ソート
- │  - 決定論順序で LLM 呼出   │       Anthropic / Ollama (LLMClient 実装を切替)
- │  - 3 回まで retry          │
- │  - budget / systemic abort │
- │  - source_hash でキャッシュ │
- └────────────────────────────┘
-      │
-      ▼ atomic swap (os.rename + cross-fs fallback + backup)
- ┌────────────────────────────┐
- │  output_dir/   (確定版)    │
- └────────────────────────────┘
+```mermaid
+flowchart TD
+    IN["input_dir/*.txt"] --> NORM["normalize_text<br/>NFKC / LF-only / 末尾 strip / 連続空白 collapse"]
+    NORM --> AD["JapaneseAnalyzer.analyze_documents<br/>(1 パス nlp.pipe: ELECTRA batch + multiproc)<br/>→ DocumentAnalysis: sentences / tfidf_token_starts+lemmas / entities (絶対 char offset)"]
+    AD -->|sentences| CHUNK["Chunker.chunk_document<br/>(事前計算 sentences を再利用,<br/> char-target + overlap + soft-split)"]
+    CHUNK -->|ChunkRecord + chunk_analysis_idx| SLICE["_slice_single_pass<br/>(bisect でチャンク範囲を切り出し,<br/> tokens_per_chunk / entities_per_chunk)"]
+    SLICE --> TFIDF["TfidfBuilder.fit_transform_pretokenized<br/>(CSR 行列 + vocab + idf)"]
+    SLICE --> AGG["aggregate_entities<br/>(min_mentions / min_chunks, OntoNotes5 label)"]
+    TFIDF --> STG[("staging/ (.staging)<br/>chunks.jsonl / vocab.npz / analyzer.json")]
+    AGG --> STG
+    STG --> WIKI["WikiGenerator.generate_all<br/>(ThreadPoolExecutor parallelism<br/>= anthropic 5 / ollama 3)<br/>pre-flight 1 call · retry 3 回 · budget · systemic abort"]
+    PREV[("output_dir/entities/manifest.json<br/>(前回の wiki を staging に pre-populate)")] -.->|source_hash 一致ならキャッシュ hit| WIKI
+    LLM{{"LLMClient<br/>(Anthropic / Ollama)"}} <-->|generate| WIKI
+    WIKI --> STG2[("staging/entities/<LABEL>__<name>_<sha6>.md<br/>entities/manifest.json<br/>index.md / log.md / ingest_result.json")]
+    STG2 --> SWAP["_atomic_swap<br/>(os.replace → backup → cross-fs fallback)"]
+    SWAP --> OUT[("output_dir/ (確定版)")]
 ```
 
-`query` と `lint` は既存 `output_dir/` を読むだけで、**input_dir は参照しません**。`analyzer.json` の `strict_match` が現ランタイムと一致することを `JapaneseAnalyzer.load_and_verify` で検証し、不一致なら `AnalyzerVersionMismatchError`。
+- 旧実装は ELECTRA を文境界抽出 + per-chunk NER で **2 回** 走らせていたが、`analyze_documents` で 1 パスに統合 (実測 -53.6%、10 ファイルで 23.17s → 10.75s)。
+- `analyze_documents` 未実装の stub analyzer (テスト) では、`batch_iter_sentences` + `_compute_tokens_and_entities_via_pipe` の 2 パス経路に自動フォールバックする。
+- `query` と `lint` は既存 `output_dir/` を読むだけで、**input_dir は参照しません**。`analyzer.json` の `strict_match` が現ランタイムと一致することを `JapaneseAnalyzer.load_and_verify` で検証し、不一致なら `AnalyzerVersionMismatchError`。
 
 ### パッケージ構成
 
@@ -78,15 +60,22 @@ src/lorebook_chunker/
   __main__.py           python -m lorebook_chunker → cli.main()
   cli.py                argparse / サブコマンド登録 / identity banner
   normalize.py          NFKC + LF + trim + collapse を 1 関数で (決定論契約)
-  analyzer.py           Ginza + Sudachi のラッパ。Ginza 5.2 ↔ spacy 3.8 の shim 内蔵
-  chunker.py            文境界を跨いだ char-target + overlap + soft-split
-  tfidf.py              TfidfBuilder: vocab.npz (matrix + vocab + idf + config) を単一 .npz に
+  analyzer.py           Ginza + Sudachi のラッパ。analyze_documents で単一パス解析.
+                        Ginza 5.2 ↔ spacy 3.8 の shim と MPS/CUDA 移動を内蔵
+  chunker.py            文境界を跨いだ char-target + overlap + soft-split.
+                        analyze_documents が計算済み sentences を受けて再推論を回避
+  tfidf.py              TfidfBuilder: fit_transform / fit_transform_pretokenized.
+                        vocab.npz (matrix + vocab + idf + config) を単一 .npz に
   ner.py                aggregate_entities: mention/chunk しきい値で刈り、決定論順序に整列
   schema.py             ChunkRecord / AnalyzerConfig / EntityAggregate / Error 型
-  wiki.py               pre-flight + retry + budget + systemic-abort + source_hash cache
-  lint.py               重複/縮退/孤立 wiki/表記近似 の 3 段階 (致命/警告/情報) 報告
-  ingest.py             IngestRunner: 全 Unit を結線 + staging dir atomic swap
+  wiki.py               pre-flight + retry + budget + systemic-abort + source_hash cache.
+                        ThreadPoolExecutor で LLM 呼び出しを並列化 (manifest/page は lock 付き書込)
+  lint.py               重複/縮退/孤立 wiki/表記近似 の 3 段階 (致命/警告/情報) 報告.
+                        rapidfuzz が入っていれば cdist で N² 類似度を高速化
+  ingest.py             IngestRunner: 全 Unit を結線 + staging dir atomic swap.
+                        analyze_documents → _slice_single_pass の 1-pass fast path 実装
   query.py              cosine top-K + OOV/zero-hit ハンドリング
+  progress.py           ProgressReporter: stderr へ phase 進捗 (TTY 単一行更新 / 非 TTY 行追記)
   _io.py                load_chunks (query/lint 共通)
   llm/
     __init__.py         LLMClient Protocol + GenerateResult + 典型 Error 階層 + get_client()
@@ -297,6 +286,13 @@ lorebook-chunker query out/ "合併の背景" --top-k 5
 lorebook-chunker lint out/
 ```
 
+`scripts/fast-ingest.sh` はハードウェア (Apple Silicon → `mps`) と LLM バックエンドを自動で最速設定に寄せる起動スクリプトです (詳細は「ベンチマーク (実測)」参照)。
+
+```bash
+ANTHROPIC_API_KEY=sk-... ./scripts/fast-ingest.sh samples/ out/            # Anthropic + MPS
+LLM_BACKEND=ollama ./scripts/fast-ingest.sh samples/ out/ --max-llm-calls 10  # Ollama オフライン + 予算キャップ
+```
+
 ### 速度を稼ぐには
 
 | 使い分け | 推奨設定 |
@@ -307,6 +303,28 @@ lorebook-chunker lint out/
 | Ollama で wiki を並列化 | `OLLAMA_NUM_PARALLEL=3 ollama serve` を起動しておき、CLI 側は既定の 3 並列でそのまま使う |
 | LLM コスト最優先 (wiki をとにかく安く) | Anthropic の [Message Batches API](https://platform.claude.com/docs/en/build-with-claude/batch-processing) を使う外部ワークフロー (本 CLI 単体では現状サポートしていない) |
 | 開発ループで LLM だけ切り離したい | `--skip-wiki` — chunks.jsonl / vocab.npz / analyzer.json のみ生成 |
+| `lint` の N² 類似度を速く | `pip install rapidfuzz` で C++ 実装の `fuzz.ratio` + `process.cdist` に自動切替 (数千 entity で 10-50x)。未インストール時は stdlib `difflib` フォールバック |
+| nlp.pipe のバッチ幅 / プロセス数を環境別にチューニング | `LOREBOOK_CHUNKER_BATCH_SIZE=32` (既定) / `LOREBOOK_CHUNKER_N_PROCESS=4` (既定) を `env` で上書き。非 cpu デバイス時は後者が自動で 1 に固定される |
+
+### ベンチマーク (実測)
+
+Apple Silicon + Ollama ローカル LLM で `scripts/fast-ingest.sh` を走らせた実測値 (2026-04-22)。
+
+**環境**: Darwin arm64 / `--device mps` / Python 3.11.15 / `ja_ginza_electra` 5.2.0 / Ollama `qwen3:8b@5bd05350f7c9a2c0` (think=False) / `--llm-parallelism 3` / `LOREBOOK_CHUNKER_BATCH_SIZE=64`
+
+**入力**: 日本語光学系ドキュメント `test_optics/` — 61 ファイル / 1.2 MB
+
+| Phase | 件数 | 時間 | スループット |
+|---|---:|---:|---:|
+| 文書解析 (1-pass ELECTRA `nlp.pipe` @ MPS) | 66 segments | 96.2 s | 0.7 seg/s |
+| チャンク切り出し (bisect スライス) | 825 chunks | ~0.0 s | 54,725 chunks/s |
+| TF-IDF 行列構築 + エンティティ集計 | vocab 12,848 / 500 entities | 数秒 | — |
+| Wiki 生成 (qwen3:8b, parallelism=3, `--max-llm-calls 10`) | 10/10 success | 482.3 s | ≈48 s/call |
+
+- `chunks.jsonl` / `vocab.npz` / `analyzer.json` + `entities/*.md` (10) + `manifest.json` + `index.md` + `log.md` + `ingest_result.json` が `out_optics_ollama/` に揃い、`exit_code=0`。
+- bisect スライスが O(1)/chunk なのは単一パス化のペイオフ — 旧実装はここで ELECTRA を 2 周目として走らせていたため数十秒オーダ。
+- 500 エンティティ全走 (Ollama qwen3:8b, parallelism=3) は約 2.2 時間の見込み。`source_hash` キャッシュにより、プロンプト / analyzer / 該当チャンクが変わらない限り 2 回目以降は LLM 再呼出ゼロ。
+- Anthropic Claude Haiku 4.5 + `--llm-parallelism 10` に切替えた場合、ネットワーク RTT と rate limit 内でさらに短縮可能 (公式 concurrency limit 内で 10 並列まで安全)。
 
 ### `lorebook-chunker ingest`
 
@@ -319,8 +337,11 @@ lorebook-chunker lint out/
 | `--llm-backend {anthropic,ollama}` | `anthropic` | LLM バックエンド。`anthropic` は `ANTHROPIC_API_KEY` 必須。|
 | `--llm-model MODEL` | バックエンド既定 | 選択したバックエンドに渡すモデル名 (下表)。|
 | `--llm-parallelism N` | anthropic=5 / ollama=3 | wiki 生成時の LLM 同時呼出数。1 を指定すると旧シリアル挙動。Ollama 利用時は `OLLAMA_NUM_PARALLEL` と揃える。|
+| `--analyzer-backend {electra,ginza}` | `electra` | 日本語 NLP バックエンド。`ginza` は軽量 (非 transformer) モデル `ja_ginza` で CPU 推論が 5〜10x 速い (NER 粒度が若干違う)。`pip install -e '.[fast]'` が必要。|
+| `--device {cpu,mps,cuda}` | `cpu` | transformer 推論デバイス。`mps` は Apple Silicon Metal で ELECTRA を高速化 (`--analyzer-backend electra` のみ効果)。非 cpu 時は `n_process=1` に強制 (GPU コンテキストはプロセス間共有不可)。数値は CPU と bit-exact ではないため POS/NER 境界で vocab/chunks が僅かに変わる可能性。|
 | `--format {human,json}` | `human` | `json` 指定時は `IngestResult` サマリが stdout に出る (agent 連携用)。|
-| `--quiet` | off | identity banner と human success 行を抑止。|
+| `--quiet` | off | identity banner と human success 行を抑止 (進捗も自動で off)。|
+| `--no-progress` | off | stderr への phase 進捗表示だけを抑止 (banner / success 行は残す)。CI / log 収集で冗長出力を避けたい時に使用。|
 
 #### `--llm-model`
 
@@ -366,6 +387,18 @@ lorebook-chunker query out/ "合併の背景" --format json | jq '.[0].chunk_id'
 | `--format {human,json}` | stdout が tty なら `human`、それ以外は自動で `json` | `human` は `[rank] chunk_id=... score=... / keywords: ... / text: ...` 形式、`json` は `QueryHit[]`。|
 
 cosine 計算は `vocab.npz` と同じ analyzer をランタイムに再現した上で行われるため、`ingest` 時と同じ解析器設定が必要です (`analyzer.json.strict_match` で検証)。**クエリが OOV / ゼロトークンの場合は exit 4** を返し、「一致なし」と区別できます。
+
+```mermaid
+flowchart LR
+    Q["query_text"] --> TOK["JapaneseAnalyzer.tokenize_for_tfidf<br/>(strict_match を load_and_verify で照合)"]
+    VOC[("vocab.npz<br/>matrix / vocabulary / idf / config")] --> REBUILD["TfidfVectorizer を pickle 復元せず<br/>vocabulary_ / idf_ を直接注入"]
+    TOK --> REBUILD
+    REBUILD --> VEC["query vector (sparse)"]
+    VEC --> COS["cosine_similarity(vec, matrix)"]
+    COS --> TOPK["top-K 並び替え"]
+    CH[("chunks.jsonl<br/>(ChunkRecord 列)")] --> TOPK
+    TOPK --> OUT["QueryHit[]<br/>(exit 0 /<br/> OOV・ゼロヒットは exit 4)"]
+```
 
 ### `lorebook-chunker lint`
 
@@ -473,6 +506,8 @@ wiki 再生成の要否は次の 3 要素を連結した sha256 で決定しま�
 - **systemic failure abort**: 5 件以上試行した時点で failure ratio > 50% なら `LLMPermanentError` を上位に raise して `exit_code=6`。staging は `.failed/` に退避。
 - **Ollama timeout**: `OllamaLLMClient` は `timeout_seconds` 既定 60 秒で、ハング時は `LLMRetryableError` に変換されます。
 - **qwen3 対応**: 既定で `think=False` を渡す。無効にしたい場合は `OllamaLLMClient(think=True)` (現在 CLI からは expose していません)。
+- **並列化**: `ThreadPoolExecutor(max_workers=parallelism)` で LLM 呼び出しを並列化。manifest/page への書き込みは `threading.Lock` で排他化 (書き込みは 5 件ごとにチェックポイント)。`--llm-parallelism 1` を指定すれば旧シリアル経路 (`_run_serial`) にフォールバックする。
+- **プロンプト入力上限**: 頻出エンティティで入力トークンが爆発しないよう、プロンプト中に積むチャンクは `DEFAULT_PROMPT_CHUNK_CAP=20` で打ち切る (`EntityAggregate.chunk_ids` は登場順ソート済なので冒頭 20 件で代表的文脈がカバーされる)。
 
 ### Ginza 5.2 × spacy 3.8 互換シム
 
