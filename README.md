@@ -22,7 +22,7 @@
 - **決定論と再現性**: `chunk_id` は `sha256(posix_path + char offset + text)` の先頭 12 桁で、破壊的全再生成後も同一入力なら同一 ID。`analyzer.json.strict_match` に Ginza モデル checksum / Sudachi 辞書 SHA-256 / 正規化契約を焼き込み、`query` / `lint` / 再 `ingest` で `AnalyzerVersionMismatchError` として fail-fast 検出。
 - **破壊的全再生成 + source_hash キャッシュ**: 毎回 `<output_dir>.staging/` で作り直して `os.replace` で atomic swap。差分 ingest はあえて提供せず、高コストな LLM 呼出だけを `source_hash`(entity テキスト + analyzer ハッシュ + prompt version) 一致でスキップ。運用モデルがシンプルで状態管理の罠が少ない。
 - **LLM 予算 / 信頼性**: pre-flight 1 call で疎通確認 (budget 外)、`LLMRetryableError` は 3 回 retry、failure ratio > 50% で systemic abort → `exit 6` + `.failed/` に manifest 退避。per-backend 既定並列度 (Anthropic 5 / Ollama 3) + `threading.Lock` 付き manifest write。
-- **観測可能性 / エージェント連携**: 各 phase を `ProgressReporter` で stderr 出力 (TTY は単一行更新 / 非 TTY は行追記)、`ingest_result.json` と `--format json` でサマリを stdout に、`log.md` に LLM トークン累計まで記録。`query` は OOV / ゼロヒットを `exit 4` で成功ゼロ件と区別。
+- **観測可能性 / エージェント連携**: 各 phase を `ProgressReporter` で stderr 出力 (TTY は単一行更新 / 非 TTY は行追記)、`run_report.json` (schema v1) と `--format json` でサマリを stdout に、`log.md` に LLM トークン累計まで記録。`query` は OOV / ゼロヒットを `exit 4` で成功ゼロ件と区別。
 - **責務の絞り込み**: 本番検索は下流 vector store 前提。TF-IDF `query` は **コーパス整形時の確認用ベースライン** と identity banner に明記し、embedding / BM25 / vector DB 書き込みは対象外として `chunks.jsonl` のスキーマ安定性だけを契約にする。
 
 ---
@@ -44,7 +44,7 @@ flowchart TD
     STG --> WIKI["WikiGenerator.generate_all<br/>(ThreadPoolExecutor parallelism<br/>= anthropic 5 / ollama 3)<br/>pre-flight 1 call · retry 3 回 · budget · systemic abort"]
     PREV[("output_dir/entities/manifest.json<br/>(前回の wiki を staging に pre-populate)")] -.->|source_hash 一致ならキャッシュ hit| WIKI
     LLM{{"LLMClient<br/>(Anthropic / Ollama)"}} <-->|generate| WIKI
-    WIKI --> STG2[("staging/entities/<LABEL>__<name>_<sha6>.md<br/>entities/manifest.json<br/>index.md / log.md / ingest_result.json")]
+    WIKI --> STG2[("staging/entities/<LABEL>__<name>_<sha6>.md<br/>entities/manifest.json<br/>index.md / log.md / run_report.json")]
     STG2 --> SWAP["_atomic_swap<br/>(os.replace → backup → cross-fs fallback)"]
     SWAP --> OUT[("output_dir/ (確定版)")]
 ```
@@ -321,7 +321,7 @@ Apple Silicon + Ollama ローカル LLM で `scripts/fast-ingest.sh` を走ら�
 | TF-IDF 行列構築 + エンティティ集計 | vocab 12,848 / 500 entities | 数秒 | — |
 | Wiki 生成 (qwen3:8b, parallelism=3, `--max-llm-calls 10`) | 10/10 success | 482.3 s | ≈48 s/call |
 
-- `chunks.jsonl` / `vocab.npz` / `analyzer.json` + `entities/*.md` (10) + `manifest.json` + `index.md` + `log.md` + `ingest_result.json` が `out_optics_ollama/` に揃い、`exit_code=0`。
+- `chunks.jsonl` / `vocab.npz` / `analyzer.json` + `entities/*.md` (10) + `manifest.json` + `index.md` + `log.md` + `run_report.json` が `out_optics_ollama/` に揃い、`exit_code=0`。
 - bisect スライスが O(1)/chunk なのは単一パス化のペイオフ — 旧実装はここで ELECTRA を 2 周目として走らせていたため数十秒オーダ。
 - 500 エンティティ全走 (Ollama qwen3:8b, parallelism=3) は約 2.2 時間の見込み。`source_hash` キャッシュにより、プロンプト / analyzer / 該当チャンクが変わらない限り 2 回目以降は LLM 再呼出ゼロ。
 - Anthropic Claude Haiku 4.5 + `--llm-parallelism 10` に切替えた場合、ネットワーク RTT と rate limit 内でさらに短縮可能 (公式 concurrency limit 内で 10 並列まで安全)。
@@ -372,7 +372,25 @@ lorebook-chunker ingest samples/ out/ --retry-failed
 lorebook-chunker ingest samples/ out/ --format json --quiet | jq .exit_code
 ```
 
-ingest 完了時に `output_dir/ingest_result.json` を必ず書き出します。JSON 形式指定時はこれが stdout にもそのまま出ます。
+ingest 完了時に `output_dir/run_report.json` を成功・失敗いずれでも必ず書き出します。JSON 形式指定時は同じ内容が stdout にもそのまま出ます。詳細スキーマは後述の「実行レポート (run_report.json)」を参照。
+
+#### 実行レポート (`run_report.json`)
+
+ingest ごとに `output_dir/run_report.json` を atomic write (tempfile → fsync → `os.replace` → parent-dir fsync) で常に出力します。スキーマ (`schema_version: 1`) は今後 **additive-only** で運用する契約で、既存キーの削除・リネーム・値域縮小は `schema_version` bump を伴います。
+
+トップレベルキー:
+
+- `schema_version` (int, 1 固定) / `lorebook_chunker_version` (str)
+- `exit_code` (int) / `exit_reason` (`{"class","message","context"}` または `null`)
+- `started_at` / `completed_at` (ISO-8601 + timezone offset) / `duration_seconds` (float)
+- `phase_durations_seconds` — 6 phase 固定キー `analyzer_init` / `chunking` / `tfidf` / `ner` / `wiki` / `swap`。各 phase は失敗しても `try/finally` でそこまでの経過秒が記録されます (0.0 にはならない)。
+- `input` — `input_dir` / `recursive` / `globs` / `encoding_option` / `files_processed` / `files_skipped` (各 skip は `SkipReport.to_jsonable()` shape)
+- `output` — `output_dir` / `chunks_generated` / `entities_generated` / `wiki_pages_written`
+- `analyzer` — `model_name` / `model_version` / `model_sha256` (`analyzer.json` の canonical hash) / `spacy_version` / `ginza_version` / `sudachi_dict`
+- `llm` — `backend` / `model_id` / `total_input_tokens` / `total_output_tokens`
+- `warnings` — `list[str]` (chunker soft-break 等)
+
+> **Breaking change**: 本リリースで旧 `output_dir` に書かれていた `ingest_result` 形式の機械可読サマリは削除され、`run_report.json` に統一されます。外部パイプラインが旧ファイルに依存している場合は `run_report.json` への移行が必要です (追加フィールド多数、キー名も一部変更)。
 
 ### `lorebook-chunker query`
 

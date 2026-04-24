@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -289,6 +290,14 @@ class IngestResult:
     # 経由で行う.
     skips: list[SkipReport] = field(default_factory=list)
     wiki_stats: WikiStats | None = None
+    # U5: 6 stable phase name (analyzer_init / chunking / tfidf / ner / wiki / swap)
+    # → duration seconds の dict. IngestRunner.run の末尾で
+    # `progress.phase_timings()` から写される. 失敗 phase も finally 経由で
+    # 記録される (wiki で例外発生 → wiki の duration は >0 で残る).
+    phase_timings: dict[str, float] = field(default_factory=dict)
+    # U5: NER 集計で閾値通過したユニークエンティティ数 (AggregationStats.accepted_entities).
+    # 現状は log.md にしか出ないので run_report.json 用に持ち上げる.
+    entities_generated: int = 0
 
     @property
     def skipped_files(self) -> int:
@@ -322,6 +331,24 @@ class IngestRunner:
         progress = ProgressReporter(enabled=self.cfg.show_progress)
         # staging は外側 try/finally で cleanup するため、try の外で宣言する.
         staging: Path | None = None
+        # U5: 現在「通過中」の phase 名と開始時刻を保持する.
+        # `_begin_phase(name)` で start、正常通過時は `_end_phase()` で記録、
+        # 例外時は outermost except/finally で `_end_phase(force=True)` を
+        # 呼び、失敗 phase の partial duration を残す.
+        _active_phase: list[str | None] = [None]
+        _active_phase_t0: list[float] = [0.0]
+
+        def _begin_phase(name: str) -> None:
+            _active_phase[0] = name
+            _active_phase_t0[0] = time.perf_counter()
+
+        def _end_phase() -> None:
+            if _active_phase[0] is not None:
+                progress._record_duration(
+                    _active_phase[0], time.perf_counter() - _active_phase_t0[0]
+                )
+                _active_phase[0] = None
+
         try:
             # U3: encoding 引数の妥当性を早期検証. "auto" 以外は Python codec
             # 名として解決可能でなければ ConfigError (exit 2).
@@ -397,8 +424,10 @@ class IngestRunner:
                         shutil.copy2(md, staging / "entities" / md.name)
 
             # 2. analyzer をロード or 新規生成
+            # U5: analyzer_init phase boundary.
             existing_analyzer = self.cfg.output_dir / "analyzer.json"
             progress.info("analyzer 初期化中 (spaCy / モデルロード)...")
+            _begin_phase("analyzer_init")
             try:
                 analyzer = self._analyzer_factory(existing_analyzer if existing_analyzer.exists() else None)
             except LorebookError:
@@ -413,8 +442,13 @@ class IngestRunner:
                     reason="init_exception",
                     cause=type(e).__name__,
                 ) from e
+            _end_phase()
 
             # 3. 入力正規化 + チャンク化
+            # U5: chunking phase boundary. ZeroChunksError / 単一パス解析での
+            # 例外はすべて outermost except で捕捉され、`_end_phase(force=True)`
+            # 相当の finally で partial duration が記録される.
+            _begin_phase("chunking")
             chunker = Chunker(
                 splitter=analyzer.iter_sentences,
                 target_chars=self.cfg.target_chars,
@@ -553,11 +587,18 @@ class IngestRunner:
                     total_input_files=result.total_input_files,
                     skipped_files=result.skipped_files,
                 )
+            _end_phase()  # U5: chunking phase 終了
 
             # 4-5. TF-IDF + NER
             # 単一パス path: ファイル単位 DocumentAnalysis から chunk 範囲でスライス.
             # 旧 Doc API path: 全 chunk text を改めて nlp.pipe に流す (ELECTRA 2 回目).
             # stub path: iter_sentences / iter_entities / tokenize_for_tfidf を個別呼び出し.
+            # U5: tfidf phase boundary. inner progress.start/end calls in
+            # `_slice_single_pass` / `_compute_tokens_and_entities_via_pipe`
+            # は `_durations` には触らず、outer phase の記録と独立に動く
+            # (それぞれ別キーで上書きされる可能性はあるが、stable key としては
+            #  "tfidf" と別の日本語名なので競合しない).
+            _begin_phase("tfidf")
             tfidf = TfidfBuilder(
                 analyzer=analyzer.tokenize_for_tfidf,
                 top_keywords=self.cfg.top_keywords,
@@ -594,15 +635,22 @@ class IngestRunner:
             keywords = tfidf.top_keywords_per_chunk(matrix, vocab)
             for chunk, kws in zip(all_chunks, keywords):
                 chunk.top_keywords = kws
+            _end_phase()  # U5: tfidf phase 終了
 
             attach_entities_to_chunks(all_chunks, entities_per_chunk)
             progress.info("エンティティ集計中...")
+            # U5: ner phase boundary.
+            _begin_phase("ner")
             aggregates, agg_stats = aggregate_entities(
                 all_chunks,
                 entities_per_chunk,
                 min_mentions=self.cfg.min_mentions,
                 min_chunks=self.cfg.min_chunks,
             )
+            # U5: entities_generated を IngestResult に持ち上げ
+            # (現在は log.md にしか出ない AggregationStats.accepted_entities).
+            result.entities_generated = agg_stats.accepted_entities
+            _end_phase()  # U5: ner phase 終了
 
             # 6. 書き出し: analyzer.json / vocab.npz / chunks.jsonl
             progress.info(
@@ -617,6 +665,9 @@ class IngestRunner:
                     f.write("\n")
 
             # 7. エンティティ wiki
+            # U5: wiki phase boundary. `--skip-wiki` 時も 0 秒で begin/end を
+            # 通すことで、stable key set ("wiki": 0.0) を維持する.
+            _begin_phase("wiki")
             wiki_stats = WikiStats()
             if not self.cfg.skip_wiki:
                 wiki_parallelism = _resolve_wiki_parallelism(
@@ -651,6 +702,9 @@ class IngestRunner:
                     _preserve_failed_manifest(self.cfg.output_dir, staging)
                     # runtime wiki 失敗 → exit 6. preflight 失敗 (exit 3) と
                     # 区別するため WikiGenerationError にラップする.
+                    # U5: phase duration は outermost except → finally で
+                    # `_end_phase()` が呼ばれて記録されるため、ここで `_end_phase()`
+                    # を呼ばなくても wiki の partial duration は残る.
                     raise WikiGenerationError(
                         f"wiki generation aborted: {e}",
                         reason=type(e).__name__,
@@ -658,6 +712,7 @@ class IngestRunner:
 
                 # 8. index.md (--skip-wiki 時には作らない — F-009)
                 _write_index_md(staging / "index.md", staging / "entities" / "manifest.json")
+            _end_phase()  # U5: wiki phase 終了 (skip_wiki=True でも記録)
 
             # 9. log.md
             _append_log_md(
@@ -680,18 +735,28 @@ class IngestRunner:
                 )
 
             # 10. atomic swap
+            # U5: swap phase boundary.
+            _begin_phase("swap")
             _atomic_swap(self.cfg.output_dir, staging)
+            _end_phase()
             result.chunks_generated = len(all_chunks)
             result.wiki_stats = wiki_stats
+            # U5: 最終段で phase_timings を result に写す.
+            result.phase_timings = progress.phase_timings()
             return result
         except LorebookError as e:
             # U1: typed LorebookError は e.exit_code を respect. context と
             # class 名は to_jsonable() で machine-readable に記録する.
+            # U5: 失敗 phase の partial duration を記録する (try/finally 相当).
+            _end_phase()
             result.exit_code = e.exit_code
             result.errors.append(e.to_jsonable())
+            result.phase_timings = progress.phase_timings()
             return result
         except Exception as e:
             # U1: 未分類例外は exit 10 fallback. class 名だけは残す.
+            # U5: 失敗 phase の partial duration を記録する.
+            _end_phase()
             logger.exception("ingest failed")
             result.exit_code = 10
             result.errors.append(
@@ -701,6 +766,7 @@ class IngestRunner:
                     "context": {},
                 }
             )
+            result.phase_timings = progress.phase_timings()
             return result
         finally:
             # F-005/F-058: 早期 return (exit_code 5/6/10 等) 時にも staging をクリーンアップ.
@@ -1027,6 +1093,55 @@ def _parse_globs_arg(value: str | None) -> tuple[str, ...]:
     return parts
 
 
+def _build_analyzer_meta(output_dir: Path) -> dict[str, Any]:
+    """`output_dir/analyzer.json` から RunReport.analyzer フィールドを構築する.
+
+    ingest 失敗で analyzer.json が書き出されなかった場合 (analyzer_init 失敗
+    / chunking ZeroChunks 前に swap 未実行) は既定値で埋める. schema key set
+    は常に同じ 6 フィールドを emit して stable にする.
+
+    Fields:
+      model_name / model_version / model_sha256 / spacy_version / ginza_version / sudachi_dict
+    """
+    ap = output_dir / "analyzer.json"
+    meta: dict[str, Any] = {
+        "model_name": "",
+        "model_version": "",
+        "model_sha256": "",
+        "spacy_version": "",
+        "ginza_version": "",
+        "sudachi_dict": "",
+    }
+    if not ap.exists():
+        return meta
+    try:
+        data = json.loads(ap.read_text(encoding="utf-8"))
+        from lorebook_chunker.wiki import compute_analyzer_json_hash
+
+        strict = data.get("strict_match") or {}
+        compat = data.get("compat_match") or {}
+        meta["model_name"] = str(strict.get("model_name", ""))
+        # Ginza 系モデルでは model_version は ginza package version と同一.
+        meta["model_version"] = str(compat.get("ginza", ""))
+        try:
+            meta["model_sha256"] = compute_analyzer_json_hash(ap)
+        except Exception:  # pragma: no cover
+            meta["model_sha256"] = ""
+        meta["spacy_version"] = str(compat.get("spacy", ""))
+        meta["ginza_version"] = str(compat.get("ginza", ""))
+        dict_pkg = compat.get("sudachidict_package", "")
+        dict_ver = compat.get("sudachidict_package_version", "")
+        if dict_pkg and dict_ver:
+            meta["sudachi_dict"] = f"{dict_pkg} {dict_ver}"
+        elif dict_pkg:
+            meta["sudachi_dict"] = str(dict_pkg)
+        elif dict_ver:
+            meta["sudachi_dict"] = str(dict_ver)
+    except (json.JSONDecodeError, OSError):  # pragma: no cover - corrupt / io
+        pass
+    return meta
+
+
 def run_ingest(args: argparse.Namespace) -> int:
     quiet = getattr(args, "quiet", False)
     if not quiet:
@@ -1085,36 +1200,96 @@ def run_ingest(args: argparse.Namespace) -> int:
                 return factory(existing_path)
             raise
 
+    # U5: started_at / completed_at / duration_seconds を run_report に
+    # 記録するため、IngestRunner の前後で wall-clock + monotonic を読む.
+    started_at_dt = datetime.now(timezone.utc).astimezone()
+    t0 = time.perf_counter()
     result = IngestRunner(
         cfg,
         analyzer_factory=_factory,
         llm_factory=get_client,
     ).run()
+    duration_seconds = time.perf_counter() - t0
+    completed_at_dt = datetime.now(timezone.utc).astimezone()
     for w in result.warnings:
         print(f"[warn] {w}", file=sys.stderr)
     for e in result.errors:
         print(f"[error] {e}", file=sys.stderr)
 
-    # F-036: success time に ingest_result.json を書き出し. JSON format 時は stdout にも出力.
-    summary = {
-        "exit_code": result.exit_code,
-        "chunks_generated": result.chunks_generated,
-        "total_input_files": result.total_input_files,
-        "skipped_files": result.skipped_files,
-        "warnings": list(result.warnings),
-        "errors": list(result.errors),
-        "output_dir": str(cfg.output_dir),
-    }
+    # U5: run_report.json を成功・失敗を問わず常に emit.
+    # `IngestResult.errors` は `{class, message, context}` dict なので
+    # exit_reason にそのまま使える.
+    from lorebook_chunker.run_report import RunReport, write as _write_run_report
+
+    exit_reason: dict[str, Any] | None = None
+    if result.exit_code != 0 and result.errors:
+        exit_reason = dict(result.errors[0])
+
+    wiki_stats = result.wiki_stats
+    llm_model_id = (wiki_stats.llm_model_id if wiki_stats else "") or ""
+    if not llm_model_id and cfg.skip_wiki:
+        llm_model_id = "noop@skip-wiki"
+    wiki_pages_written = wiki_stats.succeeded if wiki_stats else 0
+
+    report = RunReport(
+        exit_code=result.exit_code,
+        exit_reason=exit_reason,
+        started_at=started_at_dt.isoformat(),
+        completed_at=completed_at_dt.isoformat(),
+        duration_seconds=duration_seconds,
+        phase_durations_seconds=dict(result.phase_timings),
+        input={
+            "input_dir": str(cfg.input_dir),
+            "recursive": bool(cfg.recursive),
+            "globs": list(cfg.globs),
+            "encoding_option": cfg.encoding,
+            "files_processed": result.total_input_files - result.skipped_files,
+            "files_skipped": [sr.to_jsonable() for sr in result.skips],
+        },
+        output={
+            "output_dir": str(cfg.output_dir),
+            "chunks_generated": result.chunks_generated,
+            "entities_generated": result.entities_generated,
+            "wiki_pages_written": int(wiki_pages_written),
+        },
+        analyzer=_build_analyzer_meta(cfg.output_dir),
+        llm={
+            "backend": cfg.llm_backend,
+            "model_id": llm_model_id,
+            "total_input_tokens": wiki_stats.total_input_tokens if wiki_stats else 0,
+            "total_output_tokens": wiki_stats.total_output_tokens if wiki_stats else 0,
+        },
+        warnings=list(result.warnings),
+    )
+    report_dict = report.to_json_dict()
+    # Writer はエラー時も含めて常に試みる. 失敗なら RunReportError (exit 17) に
+    # 置換するが、既に非 0 exit で終わっている場合は元の exit_code を優先する
+    # (writer 失敗が一次失敗を mask しないため).
+    try:
+        _write_run_report(cfg.output_dir / "run_report.json", report)
+    except Exception as write_err:  # RunReportError 含む
+        if result.exit_code == 0:
+            # 成功 run で writer だけが失敗した場合 → exit 17 に昇格.
+            from lorebook_chunker.errors import RunReportError
+
+            if not isinstance(write_err, RunReportError):
+                write_err = RunReportError(
+                    f"run_report.json write failed: {write_err}",
+                    path=str(cfg.output_dir / "run_report.json"),
+                    reason=type(write_err).__name__,
+                )
+            result.exit_code = write_err.exit_code
+            result.errors.append(write_err.to_jsonable())
+            print(f"[error] {write_err}", file=sys.stderr)
+        else:
+            # 既に失敗している run は元の exit_code を維持し、writer 失敗は
+            # warning として stderr にだけ残す.
+            logger.warning("failed to write run_report.json: %s", write_err)
+
     fmt = getattr(args, "format", "human")
     if result.exit_code == 0:
-        try:
-            (cfg.output_dir / "ingest_result.json").write_text(
-                json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-        except OSError as e:  # pragma: no cover
-            logger.warning("failed to write ingest_result.json: %s", e)
         if fmt == "json":
-            print(json.dumps(summary, ensure_ascii=False))
+            print(json.dumps(report_dict, ensure_ascii=False))
         elif not quiet:
             print(
                 f"ingest OK: {result.chunks_generated} chunks from "
@@ -1123,5 +1298,5 @@ def run_ingest(args: argparse.Namespace) -> int:
             )
     else:
         if fmt == "json":
-            print(json.dumps(summary, ensure_ascii=False))
+            print(json.dumps(report_dict, ensure_ascii=False))
     return result.exit_code
