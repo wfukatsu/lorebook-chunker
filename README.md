@@ -499,6 +499,22 @@ wiki 再生成の要否は次の 3 要素を連結した sha256 で決定しま�
 
 途中終了 (Ctrl-C / 例外) しても `try/finally` で staging は必ず掃除されます。
 
+### Atomic swap contract
+
+`lorebook-chunker ingest` は `<output_dir>.staging/` に書き出してから `<output_dir>/` に切り替えます。契約は以下:
+
+- **同一ファイルシステム上**: 出力ディレクトリの切替は **atomic** (リーダーは旧完全版 or 新完全版のみを観測、中間状態は観測不能)。`os.replace` による POSIX directory-entry 操作。
+- **クロスデバイス (EXDEV) 境界**: `<output>.swap-tmp/` に `shutil.copytree` → `os.replace` フォールバック。コピー中の一時状態は sibling dir として存在する (再実行前に削除または保全してください)。
+- **Durability**: 電源断耐性は保証しません。クリーンシャットダウン時点まで (`fsync` + 親ディレクトリ fsync を best-effort で実施)。`F_FULLFSYNC` (macOS) は採用していません。
+- **失敗時の sibling dirs**:
+  - `<output>.staging/` — スワップ前に失敗した場合に残存
+  - `<output>.backup/` — backup rename 後に `os.replace` が失敗した場合に残存 (この状態から手動で `mv <output>.backup <output>` で復旧可能)
+  - `<output>.failed/` — wiki systemic failure でマニフェスト保全 (F-015)
+  - `<output>.swap-tmp/` — cross-device fallback 中に失敗した場合に残存
+
+  再実行前に不要な sibling dirs を削除してください。
+- `--verify-swap`: post-swap で staging manifest (`.swap.manifest.sha256`) と target 実ファイルの SHA-256 を照合 (opt-in, 数秒〜数十秒のオーバーヘッド)。**同一 FS 上では `os.replace` が inode のメタデータ操作のため pre/post hash は構造的に一致する — 本 flag の主な検出価値は EXDEV fallback 経路および I/O 層の稀な破損**。照合失敗時は `AtomicSwapError` (exit 16) を raise し、`<output>.backup/` を保持したまま終了するので手動調査が可能です。
+
 ### Deterministic ordering
 
 - **chunk_id**: POSIX 相対パス + char offset + text の sha256 (前 12 桁) で決まり、同一入力で同じ `chunk_id`。

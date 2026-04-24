@@ -435,7 +435,7 @@ def test_atomic_swap_error_caught_by_lorebook_error_branch(tmp_path: Path) -> No
     # _atomic_swap を monkeypatch して AtomicSwapError を raise させる
     import lorebook_chunker.ingest as ingest_mod
 
-    def _boom(target: Path, staging: Path) -> None:
+    def _boom(target: Path, staging: Path, *, verify: bool = False) -> None:
         raise errors.AtomicSwapError(
             "mock swap failure",
             reason="EXDEV",

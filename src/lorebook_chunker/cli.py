@@ -142,6 +142,16 @@ def _add_ingest(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="stderr への進捗表示を抑止 (--quiet でも自動で off)",
     )
+    p.add_argument(
+        "--verify-swap",
+        action="store_true",
+        help=(
+            "出力ディレクトリ切替後に staging/target の SHA-256 照合を実施する (opt-in). "
+            "同一 FS 上では os.replace が inode 操作のため tautological; "
+            "主に cross-device (EXDEV) 経路での破損検知に意味を持つ. "
+            "数秒〜数十秒のオーバーヘッド."
+        ),
+    )
 
 
 def _add_query(subparsers: argparse._SubParsersAction) -> None:

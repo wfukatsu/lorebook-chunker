@@ -41,6 +41,7 @@ from lorebook_chunker.normalize import normalize_text
 from lorebook_chunker.progress import ProgressReporter
 from lorebook_chunker.schema import ChunkRecord, SkipReport
 from lorebook_chunker.tfidf import TfidfBuilder
+from lorebook_chunker._swap import atomic_swap as _swap_atomic_swap
 from lorebook_chunker.wiki import (
     WikiGenerator,
     WikiGeneratorConfig,
@@ -254,6 +255,11 @@ class IngestConfig:
     # U3: エンコーディング. "auto" (既定) で staged detection (utf-8-sig →
     # charset-normalizer → EncodingError). 明示指定した文字列は strict decode.
     encoding: str = "auto"
+    # U6: post-swap で staging/target の SHA-256 manifest 照合を行う opt-in
+    # フラグ. 同一 FS 上では os.replace が inode 操作のため pre/post hash は
+    # tautologically 一致する. 主な検出価値は EXDEV fallback 経路および
+    # I/O 層の稀な破損. 詳細は README「Atomic swap contract」.
+    verify_swap: bool = False
 
 
 def _resolve_wiki_parallelism(
@@ -737,7 +743,7 @@ class IngestRunner:
             # 10. atomic swap
             # U5: swap phase boundary.
             _begin_phase("swap")
-            _atomic_swap(self.cfg.output_dir, staging)
+            _atomic_swap(self.cfg.output_dir, staging, verify=self.cfg.verify_swap)
             _end_phase()
             result.chunks_generated = len(all_chunks)
             result.wiki_stats = wiki_stats
@@ -949,35 +955,28 @@ def _preserve_failed_manifest(output_dir: Path, staging: Path) -> None:
         logger.warning("failed to preserve manifest for inspection: %s", e)
 
 
-def _atomic_swap(target: Path, staging: Path) -> None:
-    """target を staging の内容で置き換える. 途中キャンセル耐性は best-effort.
+def _atomic_swap(target: Path, staging: Path, *, verify: bool = False) -> None:
+    """target を staging の内容で置き換える (U6: `_swap.atomic_swap` に委譲).
 
-    手順:
-      1. target が存在するなら target.with_suffix('.backup') に move
-      2. staging を target に rename
-      3. backup を削除
+    本関数は U5 の swap phase boundary と IngestRunner 呼び出し箇所を
+    変えないための thin wrapper. 実装は `lorebook_chunker._swap.atomic_swap`
+    に切り出されており、そちらが以下を担保する:
 
-    U1: 既存 OSError の copytree fallback 分岐は保持するが、ここを貫通する
-    OSError (permission / disk full / 例外的な EXDEV fallback 失敗) は
-    AtomicSwapError (exit 16) にラップする. U6 がこの関数を抜本的に書き換える
-    予定のため、U1 はこの外殻の translation layer のみ提供する.
+    - 同一 FS 上: `os.replace` で atomic swap
+    - EXDEV: `<target>.swap-tmp/` 経由で `shutil.copytree` + `os.replace`
+    - 親ディレクトリ fsync (best-effort, tmpfs は warning + 継続)
+    - `verify=True` で SHA-256 manifest を staging 側に書き出し、swap 後に
+      target 側と照合する opt-in チェック
+    - `AtomicSwapError` (exit 16) で失敗系を統一
+
+    ここでは belt-and-suspenders として、`_swap` が `AtomicSwapError` に
+    分類しなかった uncaught `OSError` も exit 16 に拾い上げる.
     """
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        backup: Path | None = None
-        if target.exists():
-            backup = target.with_name(target.name + ".backup")
-            if backup.exists():
-                shutil.rmtree(backup)
-            target.rename(backup)
-        try:
-            staging.rename(target)
-        except OSError:
-            # rename が跨ぎで失敗する場合は copytree + rmtree
-            shutil.copytree(staging, target)
-            shutil.rmtree(staging)
-        if backup is not None and backup.exists():
-            shutil.rmtree(backup)
+        _swap_atomic_swap(target, staging, verify=verify)
+    except AtomicSwapError:
+        # 下位で正しく翻訳済み. そのまま再送.
+        raise
     except OSError as e:
         raise AtomicSwapError(
             f"atomic swap failed: {e}",
@@ -1169,6 +1168,8 @@ def run_ingest(args: argparse.Namespace) -> int:
         # U3: encoding. 値のバリデーションは cli._validate_encoding_arg で
         # 事前チェック済み. ここでは素通しで IngestConfig に載せる.
         encoding=getattr(args, "encoding", "auto"),
+        # U6: opt-in post-swap SHA-256 照合.
+        verify_swap=getattr(args, "verify_swap", False),
     )
     # `--force-regenerate` と `--retry-failed` の共存: force 優先、retry は警告
     if cfg.force_regenerate and cfg.retry_failed:
