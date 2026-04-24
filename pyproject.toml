@@ -43,6 +43,12 @@ dev = [
 fast = [
     "ja_ginza>=5.2,<6",
 ]
+# U3: `--encoding auto` の検出器フォールバック (Shift-JIS / CP932 / EUC-JP 等).
+# 未導入環境では utf-8-sig しか通らず非 UTF-8 は skip される. `[full]` extra
+# で opt-in することで charset-normalizer による検出が有効になる.
+full = [
+    "charset-normalizer>=3.4",
+]
 
 [project.scripts]
 lorebook-chunker = "lorebook_chunker.cli:main"

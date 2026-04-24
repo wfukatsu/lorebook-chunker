@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import sys
 from typing import Sequence
 
-from .errors import describe_exit_codes
+from .errors import ConfigError, describe_exit_codes
 
 IDENTITY_BANNER = (
     "lorebook-chunker: 日本語 RAG 前処理・コーパス健全性・一級エンティティ知識ベース生成ツール "
@@ -62,6 +63,17 @@ def _add_ingest(subparsers: argparse._SubParsersAction) -> None:
         help=(
             "入力ファイルを絞り込む glob パターン. カンマ区切りで複数指定可 "
             "(例: '*.txt,*.md'). 既定: '*.txt'. 絶対パスや空文字は不可."
+        ),
+    )
+    p.add_argument(
+        "--encoding",
+        default="auto",
+        metavar="NAME",
+        help=(
+            "入力ファイルのエンコーディング. 'auto' (既定) は utf-8-sig を試し、"
+            "失敗時は charset-normalizer ([full] extra 導入時のみ) で検出. "
+            "明示指定は strict decode: 'utf-8' / 'utf-8-sig' / 'cp932' / "
+            "'shift_jis' / 'euc_jp' など Python codec 名."
         ),
     )
     p.add_argument("--skip-wiki", action="store_true", help="エンティティ wiki 生成をスキップ")

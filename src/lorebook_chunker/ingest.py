@@ -14,10 +14,12 @@ from typing import Any, Callable, Iterable, NoReturn, Protocol
 
 from lorebook_chunker.chunker import Chunker
 from lorebook_chunker.cli import IDENTITY_BANNER
+from lorebook_chunker.encoding import detect_encoding
 from lorebook_chunker.errors import (
     AnalyzerInitError,
     AtomicSwapError,
     ConfigError,
+    EncodingError,
     LLMBackendUnavailableError,
     LorebookError,
     WikiGenerationError,
@@ -248,6 +250,9 @@ class IngestConfig:
     # CLI から渡すときは cli.py 側でカンマ区切り文字列をタプルに parse する.
     recursive: bool = False
     globs: tuple[str, ...] = ("*.txt",)
+    # U3: エンコーディング. "auto" (既定) で staged detection (utf-8-sig →
+    # charset-normalizer → EncodingError). 明示指定した文字列は strict decode.
+    encoding: str = "auto"
 
 
 def _resolve_wiki_parallelism(
@@ -303,6 +308,10 @@ class IngestRunner:
         # staging は外側 try/finally で cleanup するため、try の外で宣言する.
         staging: Path | None = None
         try:
+            # U3: encoding 引数の妥当性を早期検証. "auto" 以外は Python codec
+            # 名として解決可能でなければ ConfigError (exit 2).
+            _validate_encoding_option(self.cfg.encoding)
+
             input_files = _collect_input_files(
                 self.cfg.input_dir,
                 globs=self.cfg.globs,
@@ -399,11 +408,17 @@ class IngestRunner:
             )
             pipe_batch_size, pipe_n_process = _resolve_pipe_config(device=self.cfg.device)
             # 3a. ファイル読み込み + normalize (CPU 軽い) を先に一括で済ませる.
+            # U3: `detect_encoding` で staged detection (utf-8-sig → charset-normalizer).
+            # decode 失敗は現状通り skipped に落とすが、ここでは旧 warning 文字列を
+            # 継続して emit する (tests が "utf-8 decode failed" / "empty file" を
+            # assertion している). 構造化は U4 の SkipReport で差し替える.
             file_records: list[tuple[Path, str, str]] = []  # (path, relative, normalized)
             for file_path in input_files:
                 try:
-                    raw = file_path.read_text(encoding="utf-8")
-                except UnicodeDecodeError:
+                    raw, _actual_encoding = detect_encoding(
+                        file_path, override=self.cfg.encoding
+                    )
+                except (UnicodeDecodeError, EncodingError):
                     result.skipped_files += 1
                     result.warnings.append(f"utf-8 decode failed, skipped: {file_path}")
                     continue
@@ -626,6 +641,26 @@ class IngestRunner:
 
 
 # ---- helpers --------------------------------------------------------
+
+
+def _validate_encoding_option(encoding: str) -> None:
+    """U3: `--encoding` の妥当性を早期チェック.
+
+    - `"auto"` は detect_encoding の staged pipeline を意味するため pass.
+    - それ以外は `codecs.lookup()` で Python codec 名として解決可能であるこ
+      とを要求. 解決不能なら `ConfigError(reason="invalid_encoding")` (exit 2).
+    """
+    if encoding == "auto":
+        return
+    import codecs as _codecs
+    try:
+        _codecs.lookup(encoding)
+    except LookupError as exc:
+        raise ConfigError(
+            f"invalid encoding name: {encoding!r}",
+            reason="invalid_encoding",
+            encoding=encoding,
+        ) from exc
 
 
 def _validate_glob_patterns(globs: tuple[str, ...]) -> None:
@@ -886,6 +921,9 @@ def run_ingest(args: argparse.Namespace) -> int:
         # U2: 入力探索オプション.
         recursive=getattr(args, "recursive", False),
         globs=_parse_globs_arg(getattr(args, "globs", None)),
+        # U3: encoding. 値のバリデーションは cli._validate_encoding_arg で
+        # 事前チェック済み. ここでは素通しで IngestConfig に載せる.
+        encoding=getattr(args, "encoding", "auto"),
     )
     # `--force-regenerate` と `--retry-failed` の共存: force 優先、retry は警告
     if cfg.force_regenerate and cfg.retry_failed:

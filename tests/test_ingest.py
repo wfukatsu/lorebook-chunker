@@ -145,9 +145,15 @@ def test_ingest_skips_empty_and_bad_utf8_files(tmp_path: Path) -> None:
     )
     output_dir = tmp_path / "out"
 
+    # U3: `[full]` extra で charset-normalizer が入った環境では、bad UTF-8
+    # bytes が Shift-JIS / CP932 として auto 検出される可能性があり、
+    # `--encoding auto` default だと skip されず warning も消える (既存
+    # assertion "utf-8 decode failed" が壊れる). ここでは `encoding="utf-8"`
+    # 明示で strict decode に固定し、charset-normalizer 有無に依存しない
+    # 決定的挙動を要求する.
     cfg = IngestConfig(
         input_dir=input_dir, output_dir=output_dir, skip_wiki=True, target_chars=20,
-        max_chunk_chars=100,
+        max_chunk_chars=100, encoding="utf-8",
     )
     runner = IngestRunner(
         cfg,
