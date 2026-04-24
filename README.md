@@ -422,7 +422,11 @@ def atomic_swap(target, staging, *, verify=False):
 
 ### 前提環境
 
-- **Python 3.11 または 3.12**。3.13 以降は `ja-ginza-electra` 依存の `tokenizers<0.14` に prebuilt wheel が無く、Rust ソースビルドも失敗するため `pyproject.toml` で `>=3.11,<3.13` に固定しています。macOS では `brew install python@3.11` で導入できます。
+- **Python 3.11 を推奨** (CI verified)。`pyproject.toml` は `>=3.11,<3.13` を許可していますが、実運用上は:
+  - Python 3.11: **prebuilt wheel あり** — `pip install` で完結
+  - Python 3.12: `tokenizers<0.14` の prebuilt wheel が未配布で、Rust ソースビルド (`cargo rustc`) にフォールバックします。`cargo` + C compiler が入っていれば動作しますが、CI では verify していません (3.11 のみ)
+  - Python 3.13+: `tokenizers<0.14` の Rust ソースビルド自体が新しい rustc 仕様で失敗します
+- macOS では `brew install python@3.11` で導入できます。
 - macOS / Linux (M1/M2/Intel) で動作確認。Windows は ChunkRecord のパス正規化 (`Path(...).relative_to(...).as_posix()`) では対応していますが、e2e は未検証です。
 
 ### 推奨プロファイル

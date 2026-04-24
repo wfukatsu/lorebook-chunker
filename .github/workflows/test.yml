@@ -18,7 +18,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        # 3.12 は pyproject 的には許可されているが、実運用上は
+        # tokenizers<0.14 の prebuilt wheel が 3.12 向けに配布されておらず
+        # Rust source build が失敗する (spacy-transformers 1.1.9 経由で
+        # tokenizers 0.13 系を強制されるため). 3.11 のみを CI で verify し、
+        # 3.12 ローカル利用は Rust toolchain 導入が前提となる旨を
+        # README 側で明示する.
+        python-version: ["3.11"]
 
     steps:
       - name: Checkout
