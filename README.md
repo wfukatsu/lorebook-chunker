@@ -4,13 +4,41 @@
 > RAG 用コーパスの前処理・健全性・一級エンティティ知識ベース生成ツールです。
 > `query` サブコマンドはコーパス整形時の確認用 (TF-IDF コサイン類似度ベースのベースライン) であって、本番運用の検索ではありません。本番検索は下流の vector store / 検索基盤で行う前提です。
 
+## なぜ lorebook-chunker か (Value Proposition)
+
+**誰のために**: 日本語テキスト corpus を RAG / retrieval-augmented LLM の入力に変換したい開発者。特に:
+
+- 自前の原稿・ドキュメント・小説・レポートを検索基盤に載せたい運用者
+- 前処理の決定論的再現性 (回帰検出可能な pipeline) を担保したい MLOps
+- 本番 RAG の検索 backend は別途構築するが、**前処理+エンティティ知識ベース生成だけを任せたい**チーム
+
+**何を独自に解決するか**: 従来の「汎用チャンカー」は以下のいずれかで躓きます。本 CLI はこの 4 点すべてを1ツールの契約として押さえます。
+
+| 従来の痛み | 本 CLI の解 |
+|---|---|
+| 日本語分かち書き / POS / NER が pipeline を跨いで安定しない (model 版数の drift) | `analyzer.json` に Ginza model checksum + Sudachi 辞書 SHA-256 + 正規化契約を焼き込み、`query` / `lint` / 再 `ingest` で `AnalyzerVersionMismatchError` として fail-fast |
+| 破壊的再生成で LLM コストが毎回爆発 | `source_hash` (entity text + analyzer hash + prompt version) キャッシュで、LLM 呼出だけを選択的にスキップ。corpus 全体は毎回作り直す (差分 ingest の状態管理罠を避ける) |
+| 途中失敗で出力が半端になる / 復旧手順が不透明 | `<output>.staging/` → `os.replace` atomic swap、失敗時は `.backup/` / `.failed/` に退避して復旧手順を README で明示 |
+| チャンクだけ吐いて終わり — 「何が書かれているか」が後工程に伝わらない | 固有名詞単位で LLM 要約した **一級出力の wiki (`entities/*.md` + `index.md`)** を並行生成。人も LLM も引ける knowledge base を corpus とセットで納品 |
+
+**何が非スコープか** (責務の絞り込み、これは意図的):
+
+- **本番 RAG 検索自体**は対象外 — TF-IDF `query` は corpus 整形時の確認用ベースライン。検索は下流の vector store / 検索基盤で行う前提
+- 埋め込みモデル (dense vector) / BM25 / ScalarDB 等への直接書き込みは対象外。`chunks.jsonl` のスキーマ安定性のみ契約
+- HTML / PDF / Office パーサは同梱せず、`.txt` / `.md` 等のテキスト入力に集中。前処理は別ツールとの組み合わせ前提
+
+本 CLI は **「前処理 + エンティティ知識ベース生成」に一点集中した CLI** であり、RAG platform ではありません。
+
+---
+
 ## できること
 
-3 つのサブコマンドを提供します:
+4 つのサブコマンドを提供します:
 
-- **`ingest`**: `.txt` ファイル群 → チャンク化 + TF-IDF 疎ベクトル + キーワード + 固有名詞 wiki (LLM 要約) を一括生成
+- **`ingest`**: `.txt` ファイル群 → チャンク化 + TF-IDF 疎ベクトル + キーワード + 固有名詞 wiki (LLM 要約) を一括生成。U2-U9 で `--recursive` / `--glob` / `--encoding` / `--verify-swap` / `--dry-run` 等の運用 flag を追加
 - **`query`**: 保存済み TF-IDF 語彙でクエリ文をベクトル化し、コサイン類似度で上位 K チャンクを返す (ベースライン検索、本番用途ではない)
 - **`lint`**: コーパスの健全性 (空/重複/縮退チャンク、孤立 wiki、表記近似エンティティ) をチェック
+- **`doctor`**: 環境検証 (Python / 依存 / モデル / API key / 書き込み権限)。CI pre-flight 用
 
 ---
 
@@ -96,9 +124,15 @@ src/lorebook_chunker/
 
 ```
 output_dir/
-├── chunks.jsonl      # 1 行 = 1 チャンク (ChunkRecord)
-├── vocab.npz         # TF-IDF 行列 + 語彙 + IDF + vectorizer 設定
-└── analyzer.json     # ingest 時の解析器設定 (strict / compat)
+├── chunks.jsonl           # 1 行 = 1 チャンク (ChunkRecord)
+├── vocab.npz              # TF-IDF 行列 + 語彙 + IDF + vectorizer 設定
+├── analyzer.json          # ingest 時の解析器設定 (strict / compat)
+├── run_report.json        # 実行レポート (schema_version:1、常時出力、U5)
+├── log.md                 # 人間可読な実行サマリ (LLM トークン累計含む)
+├── skipped_files.jsonl    # 読み込み時にスキップされたファイル (空ファイル / decode 失敗等)。
+│                            skip 0 件時は作成されない (U4)
+└── .swap.manifest.sha256  # --verify-swap 指定時の staging SHA-256 manifest (U6)。
+                             verify 成功後に削除される。通常 run では作成されない
 ```
 
 **`chunks.jsonl`** の 1 行 (`ChunkRecord`):
@@ -235,6 +269,152 @@ cooccurring_entities: [...]
 - `6cac241cf928` (01_news.txt)
   > スカラー商事は本日、...
 ```
+
+---
+
+## アルゴリズム解説
+
+pipeline の各 phase で使う主要アルゴリズムを、実装上の工夫と合わせて 1 箇所に集約します。詳細契約は「動作保証と設計上の選択」も参照。
+
+### 単一パス ELECTRA 解析 (analyze_documents)
+
+**問題**: 素朴に書くと ELECTRA ベース NLP を 2 回走らせる羽目になります — (1) 文境界抽出のため corpus 全体を nlp、(2) chunk 切り出し後に per-chunk NER で再度 nlp。ELECTRA は重い (MPS でも 1 ファイル ~1.5s) ので 2 パスは致命的。
+
+**解**: `JapaneseAnalyzer.analyze_documents` が **1 回の `nlp.pipe`** で文境界 + tfidf lemma + 絶対 char offset 付き entity を同時回収します (`analyzer.py`)。結果を `DocumentAnalysis(sentences, tfidf_token_starts_and_lemmas, entities)` に詰め、後段の chunker / tfidf / ner はすべてこの構造体を再利用 (ELECTRA 再呼出ゼロ)。
+
+```
+旧: nlp.pipe (文境界) → chunker → per-chunk nlp.pipe (NER+tokenize) = 2 パス
+新: nlp.pipe (all at once) → chunker (sentences 使い回し) → bisect スライス  = 1 パス
+```
+
+**効果**: 実測で NLP 時間 **-53.6%** (10 ファイルで 23.17s → 10.75s, commit ログ)。chunk 切り出しは bisect で O(log N)/chunk に落ち、大規模 corpus でも ELECTRA が支配的要因にならない。
+
+**テスト stub fallback**: stub analyzer (`_StubAnalyzer`) は `analyze_documents` を持たないため、`batch_iter_sentences` + `_compute_tokens_and_entities_via_pipe` の 2 パス経路に自動フォールバック。本番パフォーマンスは落ちるが、契約は同一。
+
+### チャンク化 (char-target + 文境界 soft-split)
+
+**方針**: 機械的に N 文字で切るのではなく、**文境界を尊重しつつ char target に近付ける**。
+
+アルゴリズム (`chunker.py`):
+
+1. `target_chars` (既定 500) を目標に、`sentences` を連結して累積 char count を進める
+2. 次の文を追加すると `max_chunk_chars` (既定 1500) を超える場合:
+   - 現在のチャンクを確定
+   - `overlap_chars` (既定 100) ぶん、末尾の文を次チャンクにも含める (文脈継続のため)
+3. 1 文だけで `max_chunk_chars` を超える場合は **soft-split**: `split_by` (既定 `。` / `.`) で文内を subdivision し、それでも超える場合は `ChunkerWarning(kind="soft_break")` を警告として記録しつつ長いまま emit
+4. 全チャンクに `char_start` / `char_end` (正規化後テキストでの絶対 offset) を付与し、`chunk_id = sha256(posix_path + char_start + char_end + text)[:12]` を計算
+
+**なぜ固定文字ではなく文境界か**: 日本語では句読点が意味単位の境界を反映しており、文を跨いで切ると後段の NER が文脈破壊で誤る。
+
+### TF-IDF とキーワード抽出
+
+**tokenize_for_tfidf pipeline** (`analyzer.py`):
+
+1. `token.pos_` が `pos_allowlist` (既定 `{NOUN, VERB, ADJ, PROPN}`) に含まれるもののみ通過
+2. `stopwords` (既定で「こと」「もの」「ため」等の機能語) を除外
+3. `token.lemma_` を取得 (既に Sudachi 辞書で原形化済み)
+4. 結果の token 列 ↓
+
+**scikit-learn TfidfVectorizer に渡す方式** (`tfidf.py`):
+
+- `fit_transform_pretokenized(tokens_per_chunk)` で、`analyzer=lambda x: x` の passthrough vectorizer を使う (sklearn 側の tokenizer を経由しない — Ginza の結果が尊重される)
+- `min_df=1` / `max_df=0.95` が既定。小規模コーパスで IDF が不安定になる点は「既知の限界」に明記
+- 出力は CSR 行列を `matrix_data` / `matrix_indices` / `matrix_indptr` / `matrix_shape` に分解し、`vocab.npz` に `savez_compressed(..., allow_pickle=False)` で保存。`query` 側は pickle 復元せず vocabulary / idf を直接注入して再構築 (ClassVersionMismatch のリスクなし)
+
+**top_keywords**: 各 chunk について TF-IDF スコア上位 N 件 (`ChunkRecord.top_keywords`) を `{term, tfidf}` で inline 保存。`chunks.jsonl` を読むだけで後段が concept match できる。
+
+### NER 集約 (mention/chunk threshold + 決定論順序)
+
+**なぜ「集約」が必要か**: 頻出エンティティは全 chunk に登場するため、raw NER 結果はノイズの山。本 CLI は corpus 全体で集約し、「閾値超え」のものだけを一級出力として採用します。
+
+`aggregate_entities(chunk_analyses, min_mentions=2, min_chunks=1)` (`ner.py`):
+
+1. 全 chunk の `entities` を `(ner_label, name)` key で bucket
+2. 各 bucket に `mention_count` (登場回数) / `chunk_count` (登場した distinct chunk 数) / `chunk_ids` を集計
+3. `mention_count >= min_mentions AND chunk_count >= min_chunks` のもののみ残す
+4. **決定論順序**で整列: `mention_count DESC → chunk_count DESC → ner_label ASC → entity_name ASC`。同じ corpus なら毎回同じ順序で emit される
+
+**cooccurring_entities**: 各エンティティが登場する chunk に **共起** した他の高頻度エンティティを上位 N 件 inline 化。wiki frontmatter に載るため、下流消費者 (人 / LLM) が関連概念を辿れる。
+
+### LLM Wiki 生成 (Karpathy "LLM Wiki" 着想)
+
+**動機**: Andrej Karpathy の "LLM Wiki" 的発想 — **自動生成された knowledge base をそのまま LLM の context として引ける形**にする。汎用 document summarization とは別物: 固有名詞単位で要約し、出現 chunk への逆引きを保持。
+
+`WikiGenerator.generate_all` (`wiki.py`) の生成 pipeline:
+
+```mermaid
+flowchart TD
+    AGG["aggregate_entities 結果<br/>(決定論ソート済みエンティティ列)"] --> PRE["pre-flight 1 call<br/>(resources/preflight_prompt.txt)"]
+    PRE -->|成功| PARA["ThreadPoolExecutor<br/>(anthropic=5 / ollama=3)"]
+    PRE -->|LLMPermanentError| ABORT1["exit 3<br/>LLMBackendUnavailableError"]
+    PARA --> SRC["per-entity: source_hash 計算<br/>(entity text + analyzer hash + prompt version)"]
+    SRC -->|一致| CACHE["manifest からキャッシュ流用<br/>LLM 呼出ゼロ"]
+    SRC -->|不一致| CALL["LLMClient.generate<br/>(chunks を 20 件まで埋め込んだ prompt)"]
+    CALL -->|LLMRetryableError| RETRY["最大 3 回 retry"]
+    CALL -->|LLMPermanentError| FAIL["status=failed"]
+    CALL -->|成功| SAVE["page (entities/*.md) 保存<br/>+ manifest entry 更新<br/>(threading.Lock で排他)"]
+    FAIL --> CHECK["failure ratio > 50% (試行 5 件以上)?"]
+    CHECK -->|yes| ABORT2["systemic abort<br/>exit 6 + .failed/ に退避"]
+    CHECK -->|no| SAVE
+```
+
+**予算制御**: `--max-llm-calls N` で試行回数を上限。`mention_count DESC` 順で消化されるため、予算が切れても高価値エンティティから埋まる。pre-flight は budget に含めない (疎通確認が予算を食うと目的倒錯)。
+
+**並列化**: `ThreadPoolExecutor(max_workers=parallelism)` で並列、manifest / page への write は `threading.Lock` で排他 + 5 件ごとに checkpoint (途中 kill 耐性)。
+
+### source_hash による LLM キャッシュ
+
+wiki 再生成の要否を決める `source_hash`:
+
+```python
+source_hash = sha256(
+    json.dumps(entity_record, sort_keys=True) +
+    analyzer_json_hash +  # analyzer.json の canonical sha256
+    PROMPT_TEMPLATE_VERSION
+)
+```
+
+`entity_record` には該当エンティティの `chunk_ids` / `mention_count` / chunk 本文が含まれるため、**チャンク境界が変わる = hash 変化 = 強制再生成**。逆に chunk が不変なら前回の wiki.md を staging に丸コピーして LLM 呼出ゼロで済む。
+
+`--force-regenerate` は hash 一致でも無条件に再生成 (プロンプト改定時の全面更新用)。`--retry-failed` は `status=failed / budget_skipped` のみ再試行。
+
+### Atomic staging swap (U6 hardening 後)
+
+ingest の全出力は `<output>.staging/` で作り、最後に一括スワップ。U6 以降の契約 (`_swap.py`):
+
+```python
+def atomic_swap(target, staging, *, verify=False):
+    # 1. verify=True: staging 内全ファイルの sha256 manifest を .swap.manifest.sha256 に書き出し
+    # 2. target が存在 → target.backup に rename (既存 .backup があれば rmtree)
+    # 3. os.replace(staging, target)  ← POSIX atomic (same-fs)
+    #    失敗時:
+    #      errno.EXDEV → shutil.copytree(staging, target.swap-tmp)
+    #                    → os.replace(target.swap-tmp, target)
+    #      他の OSError → AtomicSwapError(exit 16)
+    # 4. parent-dir fsync (best-effort, tmpfs で失敗なら warning 継続)
+    # 5. verify=True: target walk して sha256 再計算 → manifest と照合
+    #    mismatch なら AtomicSwapError(verify_mismatch)、backup は保存
+    # 6. verify 成功 → manifest unlink + backup rmtree
+```
+
+**何を保証するか**:
+
+- ✅ 同一 FS 上: **atomic visibility** (リーダーは旧完全版 or 新完全版のみを観測)
+- ✅ クロスデバイス: copy-then-replace fallback (final step は atomic)
+- ✅ クラッシュ時: `.backup/` / `.staging/` / `.swap-tmp/` / `.failed/` に退避して手動復旧可能
+- ❌ 電源断耐性 (durability under power loss) は保証しない — `fsync` + parent-dir fsync は best-effort、macOS の `F_FULLFSYNC` は採用せず (性能優先)
+
+**`--verify-swap` の意味論**: 同一 FS 上は `os.replace` が inode 操作のため pre/post hash は構造的に一致する。検出価値は主に (a) EXDEV fallback 時の `copytree` 破損、(b) I/O 層の稀な bit-flip、の 2 ケースに限定される。README / CLI help に明記。
+
+### run_report.json (schema v1)
+
+1 回の ingest の観測可能性契約。成功・失敗いずれでも常に emit (`ingest.py` が atomic write):
+
+- `schema_version: 1` は今後 **additive-only** で運用 (既存キー削除・リネーム・値域縮小は v2 必須)
+- 6 phase 固定キー `analyzer_init` / `chunking` / `tfidf` / `ner` / `wiki` / `swap` の `phase_durations_seconds` は `try/finally` で失敗 phase も経過秒を記録 (0.0 にならない)
+- `exit_reason` は `LorebookError.to_jsonable()` の `{class, message, context}` 構造そのもの。外部パイプラインが「何で失敗したか」を string match ではなく class name で分岐できる
+
+詳細は「使い方 → 実行レポート (run_report.json)」を参照。
 
 ---
 
@@ -406,6 +586,11 @@ Apple Silicon + Ollama ローカル LLM で `scripts/fast-ingest.sh` を走ら�
 
 | フラグ | 既定 | 効果 |
 |---|---|---|
+| `-r` / `--recursive` | off | `input_dir` をサブディレクトリまで再帰的に探索する (既定はトップレベルのみ、U2)。|
+| `--glob PATTERN` | `*.txt` | 入力ファイル絞り込みの glob。カンマ区切りで複数 (例: `--glob '*.txt,*.md'`)、`**` は `--recursive` との組合せで使用。絶対パスは `ConfigError` (U2)。|
+| `--encoding {auto,utf-8,utf-8-sig,cp932,shift_jis,euc_jp,...}` | `auto` | 入力ファイルのエンコーディング。`auto` は `utf-8-sig` strict → `charset-normalizer` (要 `[full]`) → 失敗で `EncodingError(exit 12)` (U3)。|
+| `--dry-run` | off | `doctor` 環境チェック + 入力ファイル探索 + 先頭 64 KiB encoding probe だけを実行し、出力ディレクトリは作成しない。結果は stdout に JSON (U7)。|
+| `--verify-swap` | off | atomic swap 後に staging / target の SHA-256 照合を実行 (U6)。同一 FS 上は tautological (inode 操作) だが EXDEV fallback 経路 / I/O 破損の検知に有効。|
 | `--skip-wiki` | off | wiki / manifest / index.md を生成しない。`chunks.jsonl` + `vocab.npz` + `analyzer.json` のみ必要な用途 (開発ループで LLM 無しにイテレートしたい時) に高速。|
 | `--max-llm-calls N` | 無制限 | LLM 呼び出しの上限 (entity 試行のみ、pre-flight は budget から除外)。`mention_count DESC → chunk_count DESC → entity_name ASC` の決定論順序で消化するため、予算を絞ると高価値エンティティから wiki が入ります。|
 | `--force-regenerate` | off | source_hash 一致でも全 wiki を再生成。プロンプト変更時などに使用。|
@@ -524,15 +709,26 @@ lorebook-chunker lint out/ --format json | jq '.summary'
 
 ### `ingest`
 
-| code | 意味 |
-|---:|---|
-| 0  | 成功 |
-| 2  | `input_dir` に `.txt` が見つからない |
-| 3  | LLM バックエンドが init 時点で恒久エラー |
-| 4  | analyzer 初期化失敗 |
-| 5  | チャンク 0 件 (全ファイル空 / decode 失敗等) |
-| 6  | wiki 生成が systemic failure で abort |
-| 10 | 予期せぬ例外 (stderr / log を参照) |
+U1 の `LorebookError` taxonomy により、既存コード (0/2/3/4/5/6/10) は後方互換維持のまま、追加の構造化エラー (11-17) が raise される可能性があります。全コードは `src/lorebook_chunker/errors.py` の `EXIT_CODE_MAP` と `describe_exit_codes()` が単一ソース。
+
+| code | class | 意味 |
+|---:|---|---|
+| 0  | — | 成功 |
+| 2  | `ConfigError` | `input_dir` に対象ファイル無し、`--glob` 不正、`--encoding` 不正、など設定不整合 |
+| 3  | `LLMBackendUnavailableError` | LLM バックエンドが preflight 初期化時点で恒久エラー (API key / 認証 / network) |
+| 4  | `AnalyzerInitError` | spaCy / Ginza モデルロード失敗、`AnalyzerVersionMismatchError` 等 |
+| 5  | `ZeroChunksError` | チャンク 0 件 (全ファイル空 / decode 失敗 / 正規化後の長さ不足) |
+| 6  | `WikiGenerationError` | wiki 生成が systemic failure (failure ratio > 50%) で abort |
+| 10 | — | 分類不能な例外 (`except Exception` fallback、stderr / log.md 参照) |
+| 11 | `InputError` | per-file エラー (permission_denied / file_not_found 等、ファイル単位) |
+| 12 | `EncodingError` | エンコーディング自動検出失敗 / 明示指定での decode 失敗 |
+| 13 | `ChunkingError` | chunking ロジックの内部エラー (通常は 5 で早期検出されるため稀) |
+| 14 | `TfidfError` | TF-IDF 計算失敗 (全 chunk が空 tokenize 結果など) |
+| 15 | `EntityAggregationError` | NER 集約の内部エラー |
+| 16 | `AtomicSwapError` | atomic swap 失敗 (EXDEV fallback 失敗 / `--verify-swap` mismatch / `os.replace` EACCES 等) |
+| 17 | `RunReportError` | `run_report.json` 書き込み失敗 (disk full 等) |
+
+exit_reason は成功失敗いずれでも `run_report.json.exit_reason` に `{class, message, context}` 構造で記録されます (成功時は `null`)。
 
 ### `query`
 
