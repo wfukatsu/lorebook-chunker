@@ -25,7 +25,18 @@ class GenerateResult:
     finish_reason: str
 
 
-class LLMError(Exception):
+# U1: LLMError 系を LorebookError 派生にして library consumer の
+# `except LorebookError` dispatch に乗せる. 既存 isinstance/except
+# checks は LLMError 自体を基底として参照しているため、LLMError の
+# base を Exception → LorebookError に変更するだけで後方互換が保てる.
+# exit_code は LorebookError のデフォルト (10) を継承 — 実際の exit code
+# 3/6 は ingest.py 側で preflight/runtime を見分けて
+# LLMBackendUnavailableError / WikiGenerationError にラップする (Key
+# Technical Decisions 参照).
+from lorebook_chunker.errors import LorebookError
+
+
+class LLMError(LorebookError):
     """LLM 呼び出し関連の最上位例外."""
 
 

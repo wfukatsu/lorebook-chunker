@@ -14,6 +14,15 @@ from typing import Any, Callable, Iterable, NoReturn, Protocol
 
 from lorebook_chunker.chunker import Chunker
 from lorebook_chunker.cli import IDENTITY_BANNER
+from lorebook_chunker.errors import (
+    AnalyzerInitError,
+    AtomicSwapError,
+    ConfigError,
+    LLMBackendUnavailableError,
+    LorebookError,
+    WikiGenerationError,
+    ZeroChunksError,
+)
 from lorebook_chunker.llm import LLMClient, LLMPermanentError, get_client
 from lorebook_chunker.ner import (
     AggregationStats,
@@ -258,7 +267,10 @@ def _resolve_wiki_parallelism(
 class IngestResult:
     exit_code: int
     warnings: list[str] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)
+    # U1: errors は LorebookError.to_jsonable() 出力 (dict) または
+    # unclassified Exception を表す dict。旧 format (文字列) は廃止し、
+    # run_report.json への machine-readable dump を容易にする。
+    errors: list[dict[str, Any]] = field(default_factory=list)
     chunks_generated: int = 0
     total_input_files: int = 0
     skipped_files: int = 0
@@ -283,40 +295,52 @@ class IngestRunner:
     def run(self) -> IngestResult:
         result = IngestResult(exit_code=0)
         progress = ProgressReporter(enabled=self.cfg.show_progress)
-        input_files = _collect_input_files(self.cfg.input_dir)
-        result.total_input_files = len(input_files)
-        if not input_files:
-            result.exit_code = 2
-            result.errors.append(
-                f"no .txt files under {self.cfg.input_dir}"
-            )
-            return result
-        progress.info(
-            f"{len(input_files)} files / backend={self.cfg.analyzer_backend} "
-            f"device={self.cfg.device}"
-        )
-
-        # 早期 fail-fast: LLM バックエンド生成 (OpenAI なら即例外)
-        if not self.cfg.skip_wiki:
-            llm_config: dict[str, Any] = {}
-            if self.cfg.llm_model:
-                llm_config["model"] = self.cfg.llm_model
-            try:
-                llm = self._llm_factory(self.cfg.llm_backend, llm_config)
-            except LLMPermanentError as e:
-                result.exit_code = 3
-                result.errors.append(f"LLM backend unavailable: {e}")
-                return result
-        else:
-            llm = _NoopLLM()
-
-        # staging dir
-        staging = self.cfg.output_dir.with_name(self.cfg.output_dir.name + ".staging")
-        if staging.exists():
-            shutil.rmtree(staging)
-        staging.mkdir(parents=True, exist_ok=False)
-
+        # staging は外側 try/finally で cleanup するため、try の外で宣言する.
+        staging: Path | None = None
         try:
+            input_files = _collect_input_files(self.cfg.input_dir)
+            result.total_input_files = len(input_files)
+            if not input_files:
+                # U1: "設定が入力を生まなかった" は ConfigError (exit 2).
+                # 既存テストが assert する "no .txt" substring を message 冒頭に
+                # 残しつつ、context に structured な値を持たせる.
+                raise ConfigError(
+                    f"no .txt files under {self.cfg.input_dir}",
+                    reason="no_input_files",
+                    input_dir=str(self.cfg.input_dir),
+                    globs=["*.txt"],
+                )
+            progress.info(
+                f"{len(input_files)} files / backend={self.cfg.analyzer_backend} "
+                f"device={self.cfg.device}"
+            )
+
+            # 早期 fail-fast: LLM バックエンド生成 (OpenAI なら即例外)
+            if not self.cfg.skip_wiki:
+                llm_config: dict[str, Any] = {}
+                if self.cfg.llm_model:
+                    llm_config["model"] = self.cfg.llm_model
+                try:
+                    llm = self._llm_factory(self.cfg.llm_backend, llm_config)
+                except LLMPermanentError as e:
+                    # preflight の LLM 初期化失敗 → exit 3 (既存契約).
+                    # LLMPermanentError 自体は LorebookError 派生だが exit code
+                    # は 10 なので、ここで明示的に LLMBackendUnavailableError
+                    # にラップする (preflight vs runtime の区別を保つ).
+                    raise LLMBackendUnavailableError(
+                        f"LLM backend unavailable: {e}",
+                        backend=self.cfg.llm_backend,
+                        reason=type(e).__name__,
+                    ) from e
+            else:
+                llm = _NoopLLM()
+
+            # staging dir
+            staging = self.cfg.output_dir.with_name(self.cfg.output_dir.name + ".staging")
+            if staging.exists():
+                shutil.rmtree(staging)
+            staging.mkdir(parents=True, exist_ok=False)
+
             # 1. 既存 output_dir から manifest を読む
             existing_manifest = self.cfg.output_dir / "entities" / "manifest.json"
             # staging 側の entities/manifest.json に pre-populate する (wiki generator が load するので)
@@ -337,10 +361,18 @@ class IngestRunner:
             progress.info("analyzer 初期化中 (spaCy / モデルロード)...")
             try:
                 analyzer = self._analyzer_factory(existing_analyzer if existing_analyzer.exists() else None)
+            except LorebookError:
+                # すでに分類済み (AnalyzerInitError 派生の
+                # AnalyzerVersionMismatchError / AnalyzerNEUnavailableError 等)
+                # はそのまま伝播させる.
+                raise
             except Exception as e:
-                result.exit_code = 4
-                result.errors.append(f"analyzer init failed: {e}")
-                return result
+                # 未分類の runtime error を AnalyzerInitError (exit 4) に wrap.
+                raise AnalyzerInitError(
+                    f"analyzer init failed: {e}",
+                    reason="init_exception",
+                    cause=type(e).__name__,
+                ) from e
 
             # 3. 入力正規化 + チャンク化
             chunker = Chunker(
@@ -422,9 +454,12 @@ class IngestRunner:
                 chunk.row_index = i
 
             if not all_chunks:
-                result.exit_code = 5
-                result.errors.append("chunking produced 0 chunks")
-                return result
+                raise ZeroChunksError(
+                    "chunking produced 0 chunks",
+                    reason="zero_chunks",
+                    total_input_files=result.total_input_files,
+                    skipped_files=result.skipped_files,
+                )
 
             # 4-5. TF-IDF + NER
             # 単一パス path: ファイル単位 DocumentAnalysis から chunk 範囲でスライス.
@@ -519,11 +554,14 @@ class IngestRunner:
                 try:
                     wiki_stats = wiki.generate_all(aggregates)
                 except LLMPermanentError as e:
-                    result.exit_code = 6
-                    result.errors.append(f"wiki generation aborted: {e}")
                     # F-015: systemic-abort 時は staging の manifest を sibling dir に退避.
                     _preserve_failed_manifest(self.cfg.output_dir, staging)
-                    return result
+                    # runtime wiki 失敗 → exit 6. preflight 失敗 (exit 3) と
+                    # 区別するため WikiGenerationError にラップする.
+                    raise WikiGenerationError(
+                        f"wiki generation aborted: {e}",
+                        reason=type(e).__name__,
+                    ) from e
 
                 # 8. index.md (--skip-wiki 時には作らない — F-009)
                 _write_index_md(staging / "index.md", staging / "entities" / "manifest.json")
@@ -546,15 +584,28 @@ class IngestRunner:
             result.chunks_generated = len(all_chunks)
             result.wiki_stats = wiki_stats
             return result
+        except LorebookError as e:
+            # U1: typed LorebookError は e.exit_code を respect. context と
+            # class 名は to_jsonable() で machine-readable に記録する.
+            result.exit_code = e.exit_code
+            result.errors.append(e.to_jsonable())
+            return result
         except Exception as e:
+            # U1: 未分類例外は exit 10 fallback. class 名だけは残す.
             logger.exception("ingest failed")
             result.exit_code = 10
-            result.errors.append(f"ingest failure: {e}")
+            result.errors.append(
+                {
+                    "class": type(e).__name__,
+                    "message": f"ingest failure: {e}",
+                    "context": {},
+                }
+            )
             return result
         finally:
             # F-005/F-058: 早期 return (exit_code 5/6/10 等) 時にも staging をクリーンアップ.
             # atomic swap が成功した場合は staging は既に rename 済みで存在しない.
-            if staging.exists():
+            if staging is not None and staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)
 
 
@@ -606,22 +657,36 @@ def _atomic_swap(target: Path, staging: Path) -> None:
       1. target が存在するなら target.with_suffix('.backup') に move
       2. staging を target に rename
       3. backup を削除
+
+    U1: 既存 OSError の copytree fallback 分岐は保持するが、ここを貫通する
+    OSError (permission / disk full / 例外的な EXDEV fallback 失敗) は
+    AtomicSwapError (exit 16) にラップする. U6 がこの関数を抜本的に書き換える
+    予定のため、U1 はこの外殻の translation layer のみ提供する.
     """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    backup: Path | None = None
-    if target.exists():
-        backup = target.with_name(target.name + ".backup")
-        if backup.exists():
-            shutil.rmtree(backup)
-        target.rename(backup)
     try:
-        staging.rename(target)
-    except OSError:
-        # rename が跨ぎで失敗する場合は copytree + rmtree
-        shutil.copytree(staging, target)
-        shutil.rmtree(staging)
-    if backup is not None and backup.exists():
-        shutil.rmtree(backup)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        backup: Path | None = None
+        if target.exists():
+            backup = target.with_name(target.name + ".backup")
+            if backup.exists():
+                shutil.rmtree(backup)
+            target.rename(backup)
+        try:
+            staging.rename(target)
+        except OSError:
+            # rename が跨ぎで失敗する場合は copytree + rmtree
+            shutil.copytree(staging, target)
+            shutil.rmtree(staging)
+        if backup is not None and backup.exists():
+            shutil.rmtree(backup)
+    except OSError as e:
+        raise AtomicSwapError(
+            f"atomic swap failed: {e}",
+            reason=type(e).__name__,
+            errno=getattr(e, "errno", None) or 0,
+            source=str(staging),
+            target=str(target),
+        ) from e
 
 
 def _write_index_md(path: Path, manifest_path: Path) -> None:
@@ -715,18 +780,6 @@ class _NoopLLM:
 
 
 # ---- CLI entry ------------------------------------------------------
-
-
-INGEST_EXIT_CODES = """\
-exit codes:
-  0  success
-  2  no input .txt files under input_dir
-  3  LLM backend unavailable (permanent error at init)
-  4  analyzer init failed
-  5  chunking produced zero chunks
-  6  wiki generation aborted (systemic failure detected)
-  10 unexpected error (see log / stderr)
-"""
 
 
 def run_ingest(args: argparse.Namespace) -> int:

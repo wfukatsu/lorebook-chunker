@@ -116,13 +116,24 @@ class AnalyzerConfig:
         )
 
 
-class AnalyzerVersionMismatchError(RuntimeError):
+# U1: AnalyzerVersionMismatchError / AnalyzerNEUnavailableError は
+# analyzer 初期化 / load フェーズで raise されるため AnalyzerInitError を継承
+# (exit code 4). ChunkFileCorruptError は chunks.jsonl 読み込み時の破損検知
+# なので RunReportError ではなく ChunkingError (exit 13) を継承 — chunk
+# artifact の整合性問題という semantic に対応し、query/lint 側で
+# catch-all-LorebookError dispatch に乗る.
+# RuntimeError 多重継承は採用せず (grep `except RuntimeError` で捕捉する
+# caller が存在しないことを U1 Verification で確認済み).
+from lorebook_chunker.errors import AnalyzerInitError, ChunkingError
+
+
+class AnalyzerVersionMismatchError(AnalyzerInitError):
     """analyzer.json の strict_match が現在のランタイムと不一致."""
 
 
-class AnalyzerNEUnavailableError(RuntimeError):
+class AnalyzerNEUnavailableError(AnalyzerInitError):
     """Ginza の `token._.ne` 拡張が populate されていない."""
 
 
-class ChunkFileCorruptError(RuntimeError):
+class ChunkFileCorruptError(ChunkingError):
     """chunks.jsonl の行が JSON として壊れている."""

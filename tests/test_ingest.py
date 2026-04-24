@@ -202,8 +202,9 @@ def test_ingest_fails_on_empty_input_dir(tmp_path: Path) -> None:
         llm_factory=lambda backend, config: _ScriptedLLM([]),
     )
     result = runner.run()
-    assert result.exit_code != 0
-    assert any("no .txt" in e for e in result.errors)
+    assert result.exit_code == 2  # ConfigError(no_input_files) per U1
+    # result.errors is now list[dict] ({"class", "message", "context"}) per U1
+    assert any("no .txt" in e["message"] for e in result.errors)
 
 
 def test_ingest_skips_empty_and_bad_utf8_files(tmp_path: Path) -> None:
@@ -253,8 +254,9 @@ def test_ingest_openai_backend_fails_fast(tmp_path: Path) -> None:
         llm_factory=get_client,
     )
     result = runner.run()
-    assert result.exit_code != 0
-    assert any("OpenAI" in e or "v2" in e for e in result.errors)
+    assert result.exit_code == 3  # LLMBackendUnavailableError (preflight) per U1
+    # result.errors is now list[dict] per U1
+    assert any("OpenAI" in e["message"] or "v2" in e["message"] for e in result.errors)
 
 
 def test_ingest_atomic_swap_replaces_existing(tmp_path: Path) -> None:

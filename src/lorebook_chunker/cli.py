@@ -5,22 +5,23 @@ import argparse
 import sys
 from typing import Sequence
 
+from .errors import describe_exit_codes
+
 IDENTITY_BANNER = (
     "lorebook-chunker: 日本語 RAG 前処理・コーパス健全性・一級エンティティ知識ベース生成ツール "
     "(本番検索は下流 vector store で行う前提)"
 )
 
-INGEST_EPILOG = """\
-exit codes:
-  0   success
-  2   no input .txt files under input_dir
-  3   LLM backend unavailable (permanent error at init)
-  4   analyzer init failed
-  5   chunking produced zero chunks
-  6   wiki generation aborted (systemic failure detected)
-  10  unexpected error (see log / stderr)
-"""
+# ingest は LorebookError 階層を通じて exit code を決定するため、
+# epilog は errors.describe_exit_codes() から生成 (single source of truth).
+INGEST_EPILOG = describe_exit_codes()
 
+# NOTE: lint / query の exit code は LorebookError 階層とは別 namespace の
+# subcommand-local semantics:
+#   lint  — 0/1/2 (clean / warnings / fatal) の severity 集計
+#   query — 0/2/3/4 (hit / missing / corrupted / no-match)  の検索結果
+# ingest の LorebookError exit code (0, 2-6, 10-17) と衝突しないが、
+# 意味も異なるので errors.py に混ぜず subcommand ごとにハードコードする.
 LINT_EPILOG = """\
 exit codes:
   0  no fatal and no warning findings
