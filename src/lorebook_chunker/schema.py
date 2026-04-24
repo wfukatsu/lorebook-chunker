@@ -86,6 +86,60 @@ class EntityAggregate:
     cooccurring_entities: list[dict[str, str]] = field(default_factory=list)
 
 
+# U4: SkipReport の有効 reason 値 (enum-like 文字列).
+# これらは `skipped_files.jsonl` と (U5 以降) `run_report.json` に埋め込まれる
+# ため、値は安定した契約の一部として扱う. 新しい値を追加するときはテスト
+# `test_skip_report.py::test_skip_report_reason_values_are_stable` を更新する.
+SKIP_REASON_EMPTY_FILE = "empty_file"
+SKIP_REASON_ENCODING_DECODE_FAILED = "encoding_decode_failed"
+SKIP_REASON_ENCODING_DETECTION_FAILED = "encoding_detection_failed"
+SKIP_REASON_PERMISSION_DENIED = "permission_denied"
+SKIP_REASON_FILE_NOT_FOUND = "file_not_found"
+
+VALID_SKIP_REASONS: frozenset[str] = frozenset(
+    {
+        SKIP_REASON_EMPTY_FILE,
+        SKIP_REASON_ENCODING_DECODE_FAILED,
+        SKIP_REASON_ENCODING_DETECTION_FAILED,
+        SKIP_REASON_PERMISSION_DENIED,
+        SKIP_REASON_FILE_NOT_FOUND,
+    }
+)
+
+
+@dataclass
+class SkipReport:
+    """個別ファイルが ingest パイプラインから除外された理由を構造化した1件.
+
+    ingest.py の読み込みループが warning 文字列と並行して emit する. `log.md`
+    への flat 文字列追加は後方互換性のため維持されるが、機械可読な副作用は
+    `skipped_files.jsonl` (このクラスを 1 行1つの JSON として dump) 側に集約される.
+
+    有効な `reason` 値は `VALID_SKIP_REASONS` を参照:
+      - "empty_file": decode に成功したが strip 後に空
+      - "encoding_decode_failed": 明示指定 encoding が bytes を decode できなかった
+      - "encoding_detection_failed": auto 検出が曖昧 / 検出器未導入 / サイズ不足
+      - "permission_denied": OS 側で read 権限拒否
+      - "file_not_found": discovery と read の間でファイルが消えた
+    """
+
+    path: str
+    reason: str
+    detail: str | None = None
+    encoding_attempted: str | None = None
+    size_bytes: int | None = None
+
+    def to_jsonable(self) -> dict[str, Any]:
+        """JSON 可搬な dict を返す. None フィールドはそのまま JSON null になる."""
+        return {
+            "path": self.path,
+            "reason": self.reason,
+            "detail": self.detail,
+            "encoding_attempted": self.encoding_attempted,
+            "size_bytes": self.size_bytes,
+        }
+
+
 @dataclass
 class AnalyzerConfig:
     """analyzer.json の内容 (strict_match / compat_match / tfidf の3グループ).

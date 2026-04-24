@@ -38,7 +38,7 @@ from lorebook_chunker.ner import (
 )
 from lorebook_chunker.normalize import normalize_text
 from lorebook_chunker.progress import ProgressReporter
-from lorebook_chunker.schema import ChunkRecord
+from lorebook_chunker.schema import ChunkRecord, SkipReport
 from lorebook_chunker.tfidf import TfidfBuilder
 from lorebook_chunker.wiki import (
     WikiGenerator,
@@ -283,8 +283,23 @@ class IngestResult:
     errors: list[dict[str, Any]] = field(default_factory=list)
     chunks_generated: int = 0
     total_input_files: int = 0
-    skipped_files: int = 0
+    # U4: 構造化された skip レコード. `len(skips)` が旧 `skipped_files` int と
+    # 互換. 外部 caller は `result.skipped_files` (property) を読むだけで従来
+    # どおり int カウントを取得できる. mutation は `result.skips.append(...)`
+    # 経由で行う.
+    skips: list[SkipReport] = field(default_factory=list)
     wiki_stats: WikiStats | None = None
+
+    @property
+    def skipped_files(self) -> int:
+        """U4: `len(self.skips)` の後方互換 alias.
+
+        旧 `IngestResult` には `skipped_files: int` フィールドがあり、一部の
+        call-site (tests / CLI summary / log.md) は read 専用で参照していた.
+        U4 で構造化 `skips` を導入した後も read 側契約を維持するための
+        derived property.
+        """
+        return len(self.skips)
 
 
 # ---- Runner -----------------------------------------------------------
@@ -409,21 +424,68 @@ class IngestRunner:
             pipe_batch_size, pipe_n_process = _resolve_pipe_config(device=self.cfg.device)
             # 3a. ファイル読み込み + normalize (CPU 軽い) を先に一括で済ませる.
             # U3: `detect_encoding` で staged detection (utf-8-sig → charset-normalizer).
-            # decode 失敗は現状通り skipped に落とすが、ここでは旧 warning 文字列を
-            # 継続して emit する (tests が "utf-8 decode failed" / "empty file" を
-            # assertion している). 構造化は U4 の SkipReport で差し替える.
+            # U4: skip 発生時は `result.skips` に構造化 `SkipReport` を append し、
+            # 後段で `skipped_files.jsonl` として emit する. 既存テストが assertion
+            # している warning 文字列 ("empty file" / "utf-8 decode failed") は
+            # log.md 互換のため result.warnings にも同内容を残す.
             file_records: list[tuple[Path, str, str]] = []  # (path, relative, normalized)
             for file_path in input_files:
                 try:
                     raw, _actual_encoding = detect_encoding(
                         file_path, override=self.cfg.encoding
                     )
-                except (UnicodeDecodeError, EncodingError):
-                    result.skipped_files += 1
+                except EncodingError as e:
+                    result.skips.append(_skip_report_from_encoding_error(file_path, e))
                     result.warnings.append(f"utf-8 decode failed, skipped: {file_path}")
                     continue
+                except UnicodeDecodeError as e:
+                    # detect_encoding は EncodingError に wrap する設計だが、
+                    # 将来的な変更 / monkeypatch 経由の直接 raise に備えた safety net.
+                    result.skips.append(
+                        SkipReport(
+                            path=str(file_path),
+                            reason="encoding_decode_failed",
+                            detail=str(e),
+                            encoding_attempted=getattr(e, "encoding", None),
+                            size_bytes=_safe_stat_size(file_path),
+                        )
+                    )
+                    result.warnings.append(f"utf-8 decode failed, skipped: {file_path}")
+                    continue
+                except FileNotFoundError as e:
+                    result.skips.append(
+                        SkipReport(
+                            path=str(file_path),
+                            reason="file_not_found",
+                            detail=str(e),
+                            encoding_attempted=None,
+                            size_bytes=None,
+                        )
+                    )
+                    result.warnings.append(f"file not found, skipped: {file_path}")
+                    continue
+                except PermissionError as e:
+                    result.skips.append(
+                        SkipReport(
+                            path=str(file_path),
+                            reason="permission_denied",
+                            detail=str(e),
+                            encoding_attempted=None,
+                            size_bytes=_safe_stat_size(file_path),
+                        )
+                    )
+                    result.warnings.append(f"permission denied, skipped: {file_path}")
+                    continue
                 if not raw.strip():
-                    result.skipped_files += 1
+                    result.skips.append(
+                        SkipReport(
+                            path=str(file_path),
+                            reason="empty_file",
+                            detail=None,
+                            encoding_attempted=None,
+                            size_bytes=_safe_stat_size(file_path),
+                        )
+                    )
                     result.warnings.append(f"empty file, skipped: {file_path}")
                     continue
                 normalized = normalize_text(raw)
@@ -610,6 +672,13 @@ class IngestRunner:
                 llm_model=getattr(llm, "model_id", "noop"),
             )
 
+            # U4: skipped_files.jsonl (skip 0 件なら作成しない).
+            # staging に書き出して atomic swap と一緒に公開する.
+            if result.skips:
+                _write_skipped_files_jsonl(
+                    staging / "skipped_files.jsonl", result.skips
+                )
+
             # 10. atomic swap
             _atomic_swap(self.cfg.output_dir, staging)
             result.chunks_generated = len(all_chunks)
@@ -641,6 +710,67 @@ class IngestRunner:
 
 
 # ---- helpers --------------------------------------------------------
+
+
+# U4: EncodingError.context の reason 値のうち「auto 検出の失敗」系を
+# encoding_detection_failed に分類、それ以外は encoding_decode_failed 扱い.
+_DETECTION_FAILURE_REASONS: frozenset[str] = frozenset(
+    {
+        "detection_ambiguous",
+        "too_short_to_detect",
+        "utf8_failed_detector_unavailable",
+    }
+)
+
+
+def _safe_stat_size(path: Path) -> int | None:
+    """`path.stat().st_size` を best-effort で取得. OSError なら None."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def _skip_report_from_encoding_error(
+    path: Path, exc: EncodingError
+) -> SkipReport:
+    """`EncodingError` を SkipReport に translate する (U3 の context を活用)."""
+    context = exc.context or {}
+    ctx_reason = context.get("reason")
+    reason = (
+        "encoding_detection_failed"
+        if ctx_reason in _DETECTION_FAILURE_REASONS
+        else "encoding_decode_failed"
+    )
+    encoding_attempted = (
+        context.get("encoding_attempted")
+        or context.get("encoding")
+        or context.get("tried")
+    )
+    size_bytes = context.get("size_bytes")
+    if size_bytes is None:
+        size_bytes = _safe_stat_size(path)
+    return SkipReport(
+        path=str(path),
+        reason=reason,
+        detail=str(exc),
+        encoding_attempted=encoding_attempted,
+        size_bytes=size_bytes,
+    )
+
+
+def _write_skipped_files_jsonl(path: Path, skips: list[SkipReport]) -> None:
+    """U4: skipped_files.jsonl を staging dir 内に書き出す.
+
+    `skips` が空なら呼び出し側で skip されるべきだが、safety net として空でも
+    書き出さない (出力 dir を clean に保つ plan Approach).
+    """
+    if not skips:
+        return
+    with path.open("w", encoding="utf-8") as f:
+        for sr in skips:
+            f.write(json.dumps(sr.to_jsonable(), ensure_ascii=False))
+            f.write("\n")
 
 
 def _validate_encoding_option(encoding: str) -> None:

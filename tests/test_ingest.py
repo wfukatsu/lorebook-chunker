@@ -165,6 +165,11 @@ def test_ingest_skips_empty_and_bad_utf8_files(tmp_path: Path) -> None:
     assert result.skipped_files == 2
     assert any("empty file" in w for w in result.warnings)
     assert any("utf-8 decode failed" in w for w in result.warnings)
+    # U4: 構造化 skip レコードも 2 件, reason が enum-like 値で適切に区別される
+    assert len(result.skips) == 2
+    reasons = {sr.reason for sr in result.skips}
+    assert "empty_file" in reasons
+    assert reasons & {"encoding_decode_failed", "encoding_detection_failed"}
 
 
 def test_ingest_openai_backend_fails_fast(tmp_path: Path) -> None:
