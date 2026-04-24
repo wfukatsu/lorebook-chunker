@@ -260,6 +260,9 @@ class IngestConfig:
     # tautologically 一致する. 主な検出価値は EXDEV fallback 経路および
     # I/O 層の稀な破損. 詳細は README「Atomic swap contract」.
     verify_swap: bool = False
+    # U7: --dry-run. True の場合 IngestRunner.run() は doctor + 入力探索 +
+    # 先頭ファイル encoding probe のみ実行し、output_dir は作成しない.
+    dry_run: bool = False
 
 
 def _resolve_wiki_parallelism(
@@ -1141,10 +1144,150 @@ def _build_analyzer_meta(output_dir: Path) -> dict[str, Any]:
     return meta
 
 
+def _run_dry_run(args: argparse.Namespace, *, quiet: bool) -> int:
+    """U7: ``ingest --dry-run`` の本体.
+
+    手順:
+      1. doctor の環境 check を実行. failures があれば 18 を propagate (ingest
+         の exit code 空間 (2-17) には remap しない — doctor の空間 (0/1/18)
+         を尊重する, plan Key Technical Decisions 参照).
+      2. 入力探索 (recursive / glob 適用). ConfigError なら exit 2.
+      3. 先頭ファイルの先頭 64 KiB を bytes で読み、``detect_encoding_bytes``
+         で encoding を probe.
+      4. 結果を JSON で stdout に出力. ``output_dir`` は作成しない.
+    """
+    from lorebook_chunker.doctor import DoctorConfig, run_checks
+    from lorebook_chunker.encoding import detect_encoding_bytes
+
+    # --- 1. doctor preflight ---
+    doctor_cfg = DoctorConfig(
+        backend=getattr(args, "llm_backend", None) if not getattr(
+            args, "skip_wiki", False
+        ) else None,
+        output_dir=Path(args.output_dir) if getattr(args, "output_dir", None) else None,
+        json_output=True,  # --dry-run は常に JSON 出力 (stdout-only)
+        quiet=True,
+    )
+    doctor_summary = run_checks(doctor_cfg)
+    if doctor_summary.failures > 0:
+        # doctor の exit 18 を propagate. 結果 JSON も含めて stdout に出す.
+        out = {
+            "dry_run": True,
+            "doctor_summary": doctor_summary.to_jsonable(),
+            "doctor_exit_code": doctor_summary.exit_code,
+            "note": (
+                "doctor returned env-critical failure (exit 18). "
+                "ingest skipped."
+            ),
+        }
+        print(json.dumps(out, ensure_ascii=False))
+        return doctor_summary.exit_code
+
+    # --- 2. 入力探索 ---
+    input_dir = Path(args.input_dir)
+    globs = _parse_globs_arg(getattr(args, "globs", None))
+    recursive = bool(getattr(args, "recursive", False))
+    encoding_option = getattr(args, "encoding", "auto")
+
+    # encoding 引数の妥当性を早期検証 (ingest runner と同じ strictness).
+    try:
+        _validate_encoding_option(encoding_option)
+    except ConfigError as e:
+        err_payload = {
+            "dry_run": True,
+            "doctor_summary": doctor_summary.to_jsonable(),
+            "error": e.to_jsonable(),
+        }
+        print(json.dumps(err_payload, ensure_ascii=False))
+        return e.exit_code
+
+    try:
+        input_files = _collect_input_files(
+            input_dir, globs=globs, recursive=recursive
+        )
+    except ConfigError as e:
+        err_payload = {
+            "dry_run": True,
+            "doctor_summary": doctor_summary.to_jsonable(),
+            "error": e.to_jsonable(),
+        }
+        print(json.dumps(err_payload, ensure_ascii=False))
+        return e.exit_code
+
+    if not input_files:
+        # ConfigError の no_input_files (既存 ingest と同じ契約).
+        label = (
+            ".txt"
+            if tuple(globs) == ("*.txt",)
+            else ", ".join(globs)
+        )
+        e = ConfigError(
+            f"no {label} files under {input_dir}",
+            reason="no_input_files",
+            input_dir=str(input_dir),
+            globs=list(globs),
+            recursive=recursive,
+        )
+        err_payload = {
+            "dry_run": True,
+            "doctor_summary": doctor_summary.to_jsonable(),
+            "error": e.to_jsonable(),
+        }
+        print(json.dumps(err_payload, ensure_ascii=False))
+        return e.exit_code
+
+    # --- 3. 先頭ファイルの encoding probe ---
+    sample_size = 64 * 1024
+    first = input_files[0]
+    probe: dict[str, Any] = {
+        "path": str(first),
+        "encoding": None,
+        "sample_bytes_examined": 0,
+    }
+    try:
+        with first.open("rb") as fh:
+            sample = fh.read(sample_size)
+        probe["sample_bytes_examined"] = len(sample)
+        _text, enc_name = detect_encoding_bytes(sample, override=encoding_option)
+        probe["encoding"] = enc_name
+    except OSError as exc:
+        probe["encoding"] = "read_failed"
+        probe["detail"] = str(exc)
+
+    out_dir_will_be = str(Path(args.output_dir))
+
+    # --- 4. JSON summary を stdout に emit ---
+    summary_dict = {
+        "dry_run": True,
+        "doctor_summary": doctor_summary.to_jsonable(),
+        "files_discovered": len(input_files),
+        "first_file_path": str(first),
+        "first_file_encoding_probe": probe,
+        "output_dir_will_be": out_dir_will_be,
+        "output_dir_created": False,
+        "input": {
+            "input_dir": str(input_dir),
+            "recursive": recursive,
+            "globs": list(globs),
+            "encoding_option": encoding_option,
+        },
+    }
+    print(json.dumps(summary_dict, ensure_ascii=False))
+    return 0
+
+
 def run_ingest(args: argparse.Namespace) -> int:
     quiet = getattr(args, "quiet", False)
-    if not quiet:
+    if not quiet and not getattr(args, "dry_run", False):
         print(IDENTITY_BANNER, file=sys.stderr)
+
+    # U7: --dry-run は IngestRunner を構築せずに早期 return する.
+    # doctor 経由で exit 18 を propagate する可能性があるため、通常の
+    # LorebookError (2-17) 空間ではなく doctor の空間 (0/1/18) を尊重.
+    if getattr(args, "dry_run", False):
+        if not quiet:
+            print(IDENTITY_BANNER, file=sys.stderr)
+        return _run_dry_run(args, quiet=quiet)
 
     cfg = IngestConfig(
         input_dir=Path(args.input_dir),

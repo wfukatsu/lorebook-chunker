@@ -152,6 +152,16 @@ def _add_ingest(subparsers: argparse._SubParsersAction) -> None:
             "数秒〜数十秒のオーバーヘッド."
         ),
     )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "事前検証のみ実行: doctor サブコマンドの環境チェック + 入力ファイル探索 + "
+            "先頭ファイルの encoding probe (64 KiB sample). "
+            "出力ディレクトリは作成せず、stdout に JSON サマリを出力. "
+            "doctor が critical failure を返した場合はその exit 18 を propagate する."
+        ),
+    )
 
 
 def _add_query(subparsers: argparse._SubParsersAction) -> None:
@@ -257,6 +267,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_ingest(subparsers)
     _add_query(subparsers)
     _add_lint(subparsers)
+    # doctor は ingest 系とは別 exit code 空間 (0/1/18) を使うため、
+    # subparser 登録のみ cli.py 側で行い、引数定義は doctor.py に委譲する.
+    from lorebook_chunker.doctor import add_doctor_subparser
+    add_doctor_subparser(subparsers)
     return parser
 
 
@@ -273,6 +287,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "lint":
         from lorebook_chunker.lint import run_lint
         return run_lint(args)
+    if args.command == "doctor":
+        from lorebook_chunker.doctor import run_doctor
+        return run_doctor(args)
 
     parser.print_help(sys.stderr)
     return 2

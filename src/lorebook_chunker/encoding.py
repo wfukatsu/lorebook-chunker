@@ -44,6 +44,59 @@ DEFAULT_CHAOS_THRESHOLD: float = 0.3
 MIN_SIZE_FOR_DETECTION: int = 100
 
 
+def detect_encoding_bytes(
+    data: bytes,
+    *,
+    override: str = "auto",
+    chaos_threshold: float = DEFAULT_CHAOS_THRESHOLD,
+) -> tuple[str, str]:
+    """byte 列に対する軽量 encoding probe. ``detect_encoding`` の path 版と同じ
+    staged pipeline を data: bytes に対して実行する.
+
+    U7 の ``ingest --dry-run`` が最初のファイルの先頭 64 KiB sample に対して
+    書き込みなしで encoding を推定するために使う. path 版と違って `EncodingError`
+    は raise しない (dry-run は pre-flight であり、skip/fail を早い段階で
+    宣言する情報価値が低いため). 代わりに best-effort で
+    ``(decoded_or_empty, encoding_or_"unknown")`` を返す.
+
+    Args:
+        data: 対象 bytes (ファイル先頭のサンプルで十分)
+        override: ``"auto"`` (既定) または明示 codec 名. 非 auto で decode 失敗
+            時は ``("", "decode_failed")`` を返す.
+
+    Returns:
+        ``(decoded_text, encoding_name)``. 推定不能時は ``("", "unknown")``.
+    """
+    if override != "auto":
+        try:
+            return data.decode(override), override
+        except (UnicodeDecodeError, LookupError):
+            return "", "decode_failed"
+
+    # auto: utf-8-sig を先に試す.
+    try:
+        return data.decode("utf-8-sig"), "utf-8-sig"
+    except UnicodeDecodeError:
+        pass
+
+    if not _CHARSET_NORMALIZER_AVAILABLE:
+        return "", "unknown"
+
+    # charset-normalizer を試す.
+    assert _charset_normalizer is not None
+    try:
+        matches = _charset_normalizer.from_bytes(data, steps=5, chunk_size=512)
+        best = matches.best()
+    except Exception:  # pragma: no cover - library-side failures
+        return "", "unknown"
+    if best is None:
+        return "", "unknown"
+    chaos = float(getattr(best, "chaos", 1.0))
+    if chaos >= chaos_threshold:
+        return "", "unknown"
+    return str(best), str(best.encoding)
+
+
 def detect_encoding(
     path: Path,
     *,
@@ -210,6 +263,7 @@ def _format_candidates(matches: Any) -> list[dict[str, Any]]:
 
 __all__ = [
     "detect_encoding",
+    "detect_encoding_bytes",
     "DEFAULT_CHAOS_THRESHOLD",
     "MIN_SIZE_FOR_DETECTION",
     "_CHARSET_NORMALIZER_AVAILABLE",

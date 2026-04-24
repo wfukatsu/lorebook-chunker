@@ -245,15 +245,91 @@ cooccurring_entities: [...]
 - **Python 3.11 または 3.12**。3.13 以降は `ja-ginza-electra` 依存の `tokenizers<0.14` に prebuilt wheel が無く、Rust ソースビルドも失敗するため `pyproject.toml` で `>=3.11,<3.13` に固定しています。macOS では `brew install python@3.11` で導入できます。
 - macOS / Linux (M1/M2/Intel) で動作確認。Windows は ChunkRecord のパス正規化 (`Path(...).relative_to(...).as_posix()`) では対応していますが、e2e は未検証です。
 
-### 依存インストール
+### 推奨プロファイル
+
+5 つのオプショナル extra を用途別に用意しています。複数組み合わせ可 (例: `pip install -e '.[fast,full]'`)。
+
+| プロファイル | コマンド | 用途 |
+|---|---|---|
+| minimal | `pip install lorebook-chunker` | 最小構成。ELECTRA 版 GiNZA + UTF-8 入力のみ |
+| fast    | `pip install lorebook-chunker[fast]` | `ja_ginza` (非 transformer) で CPU 推論 5-10x 高速 (NER 精度は若干トレード) |
+| full    | `pip install lorebook-chunker[full]` | + `charset-normalizer` (Shift-JIS / CP932 / EUC-JP など auto 検出)。**小説・青空文庫系の legacy 日本語入力を扱う場合は推奨** |
+| bench   | `pip install lorebook-chunker[bench]` | + `ranx` (RAG 検索品質ベンチマーク、`scripts/bench.py` 用) |
+| dev     | `pip install lorebook-chunker[dev]` | + `pytest` / `pytest-mock` (コントリビュータ向け) |
+
+組み合わせ例:
+
+```bash
+# 書き散らし日本語 corpus + 本番運用で wiki 要約はそのまま
+pip install -e '.[full]'
+
+# 開発ループ (テスト実行 + fast analyzer)
+pip install -e '.[fast,dev]'
+
+# RAG チューニングセッション (自前 corpus で chunk_size を最適化)
+pip install -e '.[full,bench]'
+```
+
+### 依存インストール (標準手順)
 
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 python -m spacy validate                # ja_ginza_electra の導入確認 (✔ が出れば OK)
+lorebook-chunker doctor                 # 環境検証 (U7 で追加、exit 0/1/18)
 ```
 
 `ja_ginza_electra` は PyPI 未公開のため GitHub Releases の wheel を URL 依存 (sha256 ピン) で取得します。初回 `lorebook-chunker ingest` 実行時に ELECTRA transformer 本体 (~400MB) が HuggingFace Hub から追加ダウンロードされます (オフラインなら `HF_HUB_OFFLINE=1` + 事前キャッシュが必要)。
+
+### 環境検証 (doctor / `--dry-run`)
+
+初回セットアップ・CI 環境・新しいマシンで「本当に走るか」を数秒で確認するための pre-flight ツールを 2 つ用意しています。
+
+#### `lorebook-chunker doctor`
+
+Python バージョン・主要依存 (`spacy` / `ginza`)・モデル (`ja_ginza_electra` または `ja_ginza`)・オプション (`charset-normalizer` / `anthropic` / `ollama` / `ranx`)・書き込み可否を 1 パスで点検します。
+
+```bash
+lorebook-chunker doctor                           # 基本チェック
+lorebook-chunker doctor --backend anthropic       # + ANTHROPIC_API_KEY を確認
+lorebook-chunker doctor --backend ollama          # + ollama.show() で 5s timeout 付き疎通
+lorebook-chunker doctor --output-dir out/         # + out/ の親ディレクトリに tempfile を書いて writable 確認
+lorebook-chunker doctor --check-bench             # + ranx ([bench] extra) の導入有無を確認
+lorebook-chunker doctor --json                    # 機械可読 JSON (構造化 summary)
+```
+
+**exit code は ingest / query / lint とは独立した namespace (0 / 1 / 18):**
+
+| code | 意味 |
+|---:|---|
+| 0 | 全 check が pass |
+| 1 | warnings のみ (例: `charset-normalizer` 未導入) — 動作はするが sub-optimal |
+| 18 | 1 件以上の env-critical failure (Python / spacy / ginza / モデル等) |
+
+ingest 系 (2-17) と衝突しないため、subprocess 連携スクリプトで「doctor の fail は 18 を見る」「ingest の fail は 2-17 を見る」と安全に分岐できます。
+
+#### `lorebook-chunker ingest --dry-run`
+
+ingest の引数 (入力ディレクトリ / `--recursive` / `--glob` / `--encoding`) をそのまま渡しつつ、doctor の環境チェック → 入力ファイル探索 → 先頭ファイルの先頭 64 KiB に対する encoding probe だけを実行し、**出力ディレクトリは作成しません**。結果は stdout に JSON で返します。
+
+```bash
+lorebook-chunker ingest --dry-run samples/ out/
+```
+
+```json
+{
+  "dry_run": true,
+  "doctor_summary": {"passed": 6, "warnings": 0, "failures": 0, "checks": [...]},
+  "files_discovered": 4,
+  "first_file_path": "samples/01_news.txt",
+  "first_file_encoding_probe": {"path": "...", "encoding": "utf-8-sig", "sample_bytes_examined": 4096},
+  "output_dir_will_be": "out",
+  "output_dir_created": false,
+  "input": {"input_dir": "samples", "recursive": false, "globs": ["*.txt"], "encoding_option": "auto"}
+}
+```
+
+内部的に doctor を呼び出すため、doctor が exit 18 を返した場合はその 18 を propagate します (ingest 系の 12/16 に remap しません)。入力ファイル 0 件の場合は ingest と同じ exit 2 (`ConfigError(reason="no_input_files")`) を返します。
 
 ### LLM バックエンドの準備
 
@@ -474,6 +550,16 @@ lorebook-chunker lint out/ --format json | jq '.summary'
 | 0  | 致命も警告もゼロ |
 | 1  | 警告のみ (致命ゼロ) |
 | 2  | 致命が 1 件以上 |
+
+### `doctor`
+
+ingest 系 (2-17) とは独立した namespace。
+
+| code | 意味 |
+|---:|---|
+| 0  | 全 check が pass |
+| 1  | warnings のみ (`charset-normalizer` 未導入等、動作は可能) |
+| 18 | 1 件以上の env-critical failure (Python バージョン / spacy / ginza / モデル等) |
 
 ---
 
