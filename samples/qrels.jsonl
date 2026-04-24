@@ -1,0 +1,8 @@
+{"qid": "q1", "query": "スカラー商事とアルファ合成の合併の背景", "relevant": [{"chunk_id": "08ed5bc2ff40", "grade": 2}, {"chunk_id": "6cac241cf928", "grade": 2}, {"chunk_id": "93fc3f7f0928", "grade": 1}]}
+{"qid": "q2", "query": "合併後の新会社名と新体制の発足時期", "relevant": [{"chunk_id": "3c5b94e0e5e5", "grade": 2}, {"chunk_id": "08ed5bc2ff40", "grade": 1}, {"chunk_id": "6cac241cf928", "grade": 1}]}
+{"qid": "q3", "query": "ベータプロジェクトの技術スタック", "relevant": [{"chunk_id": "0f1025116c67", "grade": 2}]}
+{"qid": "q4", "query": "田中と佐藤の対談 経営統合について", "relevant": [{"chunk_id": "93fc3f7f0928", "grade": 2}, {"chunk_id": "08ed5bc2ff40", "grade": 1}, {"chunk_id": "6cac241cf928", "grade": 1}]}
+{"qid": "q5", "query": "東京本社と大阪支社の統合計画", "relevant": [{"chunk_id": "3c5b94e0e5e5", "grade": 2}, {"chunk_id": "0f1025116c67", "grade": 1}]}
+{"qid": "q6", "query": "灰色の空を独りで歩く情景", "relevant": [{"chunk_id": "ecf8b2c245ae", "grade": 2}]}
+{"qid": "q7", "query": "プロジェクトの品質保証を担当する支社", "relevant": [{"chunk_id": "0f1025116c67", "grade": 2}]}
+{"qid": "q8", "query": "スカラー商事の株価と合併発表", "relevant": [{"chunk_id": "08ed5bc2ff40", "grade": 2}, {"chunk_id": "6cac241cf928", "grade": 2}]}

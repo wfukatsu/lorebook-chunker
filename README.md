@@ -563,6 +563,69 @@ ingest 系 (2-17) とは独立した namespace。
 
 ---
 
+## RAG 検索評価ベンチマーク (チューニング / regression 用途)
+
+> **位置づけ**: 本ベンチマークは **自前 corpus 上での chunking params チューニング / regression 検出用途** です。ツール間の quality 比較は対象外。外部データセット (JQaRA, MIRACL-ja 等) との比較は別 release で検討予定です。
+
+`scripts/bench.py` は chunking params (`chunk_size` / `overlap`) と wiki 生成の on/off を切り替えながら、手書きの小さな gold set (qrels) に対して `recall@5 / recall@10 / MRR@10 / nDCG@10` を計算し、config 間の比較表を出します。評価エンジンは [ranx](https://github.com/AmenRa/ranx) (opt-in `[bench]` extra)。
+
+### インストール
+
+```bash
+pip install -e '.[bench]'   # ranx を含む extra
+```
+
+### 使い方
+
+```bash
+python scripts/bench.py samples/ \
+    --configs c256=chunk:256,overlap:32,wiki:off \
+    --configs c512=chunk:512,overlap:64,wiki:off \
+    --qrels samples/qrels.jsonl \
+    --out bench_out/ \
+    --json bench_report.json
+```
+
+- `--configs NAME=key:val,...`: 比較対象の chunking config。キーは `chunk` (int) / `overlap` (int) / `wiki` (on|off)。**最低 2 つ必要** (単一 config は比較にならないため)。
+- `--qrels`: 手書きの qrels JSONL (下記参照)。
+- `--out`: 各 config の ingest 出力を置く親ディレクトリ (`<out>/<name>/`)。
+- `--json`: machine-readable なレポートを出力 (省略可)。
+
+stdout には rich 対応ターミナルで装飾付き表、非対応時は plain text 表を出力します。
+
+### qrels JSONL 形式
+
+1 行 1 クエリ。`relevant` は正解チャンクのリストで、`grade` は 0-2 の TREC 慣習 (2 がより強い正解)。未記載の chunk_id は grade 0 (=非該当) として扱われます。
+
+```jsonl
+{"qid": "q1", "query": "合併の背景", "relevant": [{"chunk_id": "08ed5bc2ff40", "grade": 2}]}
+{"qid": "q2", "query": "ベータプロジェクトの責任者", "relevant": [{"chunk_id": "0f1025116c67", "grade": 2}]}
+```
+
+`chunk_id` は `ingest` が生成する **content-dependent hash** (12-char) です。`chunk_size` / `overlap` を変えると chunk 境界が変わり、結果として chunk_id も変わります。そのため初回は:
+
+1. 評価したい config の 1 つで `lorebook-chunker ingest samples/ ref_out/ --skip-wiki` を実行
+2. `ref_out/chunks.jsonl` を見て正解チャンクの `chunk_id` を採取
+3. `samples/qrels.jsonl` に転記
+
+という手順で作成します。他 config で chunk_id が変わって qrels 側に不在になったエントリは、その config では自動的に recall/ndcg 0 として degrade します (crash はしません)。gold set は **最小限に留めて手動メンテする前提** です。
+
+### 終了コード
+
+| code | 意味 |
+|---:|---|
+| 0  | 成功 (少なくとも 1 config が ok) |
+| 2  | ConfigError (ranx 未導入 / qrels 欠落/空 / config spec 不正 / `--configs` が 1 個未満) |
+| 3-17 | 全 config が ingest 失敗した場合に最初の失敗 exit code を propagate (詳細は上記 `ingest` の exit code 表) |
+
+### scope 制限 (採用しない機能)
+
+- **paired t-test / significance marker**: `ranx.compare()` は使用しません。tiny-corpus ではサンプル数が検定に足りないため、誤った overconfidence を避ける狙いです。必要になれば別 unit で検討。
+- **外部データセット integration**: JQaRA / MIRACL-ja 等との比較は future work。
+- **`bench_configs.json` schema**: CLI 引数 (`--configs` 複数回) のみで表現します。
+
+---
+
 ## 動作保証と設計上の選択
 
 ### 破壊的全再生成
