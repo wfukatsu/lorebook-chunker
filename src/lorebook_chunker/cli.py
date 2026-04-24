@@ -48,6 +48,22 @@ def _add_ingest(subparsers: argparse._SubParsersAction) -> None:
     )
     p.add_argument("input_dir", help="入力ディレクトリ (.txt を含む)")
     p.add_argument("output_dir", help="出力ディレクトリ (破壊的全再生成)")
+    p.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="入力ディレクトリをサブディレクトリまで再帰的に探索する (既定: トップレベルのみ)",
+    )
+    p.add_argument(
+        "--glob",
+        dest="globs",
+        default="*.txt",
+        metavar="PATTERN",
+        help=(
+            "入力ファイルを絞り込む glob パターン. カンマ区切りで複数指定可 "
+            "(例: '*.txt,*.md'). 既定: '*.txt'. 絶対パスや空文字は不可."
+        ),
+    )
     p.add_argument("--skip-wiki", action="store_true", help="エンティティ wiki 生成をスキップ")
     p.add_argument("--max-llm-calls", type=int, default=None, help="LLM 呼び出しの上限 (entity 試行のみ, pre-flight は除外)")
     p.add_argument("--force-regenerate", action="store_true", help="全 wiki を無条件再生成")

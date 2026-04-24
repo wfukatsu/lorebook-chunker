@@ -243,6 +243,11 @@ class IngestConfig:
     device: str = "cpu"
     # 進捗表示 (stderr). --quiet で False, CLI で明示的に --no-progress が付けば False.
     show_progress: bool = True
+    # U2: 入力探索. recursive=True なら rglob, それ以外は glob.
+    # globs は default ("*.txt",) で後方互換. tuple なら内部 API から直接指定可能、
+    # CLI から渡すときは cli.py 側でカンマ区切り文字列をタプルに parse する.
+    recursive: bool = False
+    globs: tuple[str, ...] = ("*.txt",)
 
 
 def _resolve_wiki_parallelism(
@@ -298,17 +303,28 @@ class IngestRunner:
         # staging は外側 try/finally で cleanup するため、try の外で宣言する.
         staging: Path | None = None
         try:
-            input_files = _collect_input_files(self.cfg.input_dir)
+            input_files = _collect_input_files(
+                self.cfg.input_dir,
+                globs=self.cfg.globs,
+                recursive=self.cfg.recursive,
+            )
             result.total_input_files = len(input_files)
             if not input_files:
                 # U1: "設定が入力を生まなかった" は ConfigError (exit 2).
                 # 既存テストが assert する "no .txt" substring を message 冒頭に
                 # 残しつつ、context に structured な値を持たせる.
+                # default globs ("*.txt",) 時は従来どおり "no .txt files" 表示.
+                label = (
+                    ".txt"
+                    if tuple(self.cfg.globs) == ("*.txt",)
+                    else ", ".join(self.cfg.globs)
+                )
                 raise ConfigError(
-                    f"no .txt files under {self.cfg.input_dir}",
+                    f"no {label} files under {self.cfg.input_dir}",
                     reason="no_input_files",
                     input_dir=str(self.cfg.input_dir),
-                    globs=["*.txt"],
+                    globs=list(self.cfg.globs),
+                    recursive=self.cfg.recursive,
                 )
             progress.info(
                 f"{len(input_files)} files / backend={self.cfg.analyzer_backend} "
@@ -612,10 +628,62 @@ class IngestRunner:
 # ---- helpers --------------------------------------------------------
 
 
-def _collect_input_files(input_dir: Path) -> list[Path]:
+def _validate_glob_patterns(globs: tuple[str, ...]) -> None:
+    """U2: glob pattern の前提 (non-empty / relative / no path separator 開始) を検証.
+
+    違反時は `ConfigError(reason="invalid_glob")` を raise. recursive discovery でも
+    `rglob` に絶対パスや path-separator 開始は渡せないため、ここで早期に弾く.
+    """
+    if not globs:
+        raise ConfigError(
+            "at least one --glob pattern is required",
+            reason="invalid_glob",
+            pattern="",
+        )
+    for pattern in globs:
+        if not pattern:
+            raise ConfigError(
+                "empty --glob pattern is not allowed",
+                reason="invalid_glob",
+                pattern=pattern,
+            )
+        p = Path(pattern)
+        if p.is_absolute() or pattern.startswith(("/", os.sep)):
+            raise ConfigError(
+                f"absolute --glob pattern is not allowed: {pattern!r}",
+                reason="invalid_glob",
+                pattern=pattern,
+            )
+
+
+def _collect_input_files(
+    input_dir: Path,
+    *,
+    globs: tuple[str, ...] = ("*.txt",),
+    recursive: bool = False,
+) -> list[Path]:
+    """U2: recursive/pattern 対応の入力ファイル収集.
+
+    - `recursive=True` なら `rglob`、False なら `glob`
+    - 各 pattern を iterate しつつ `resolve()` 済みパスで dedupe
+    - 昇順 sort で決定論的順序を返す
+    - pattern 妥当性は caller からも使えるよう `_validate_glob_patterns` で検証
+    """
+    _validate_glob_patterns(globs)
     if not input_dir.exists() or not input_dir.is_dir():
         return []
-    return sorted(input_dir.glob("*.txt"))
+    seen: dict[Path, Path] = {}
+    for pattern in globs:
+        iterator = (
+            input_dir.rglob(pattern) if recursive else input_dir.glob(pattern)
+        )
+        for path in iterator:
+            if not path.is_file():
+                continue
+            key = path.resolve()
+            if key not in seen:
+                seen[key] = path
+    return sorted(seen.values())
 
 
 def _ginza_model_version(analyzer: IngestAnalyzer) -> str:
@@ -782,6 +850,18 @@ class _NoopLLM:
 # ---- CLI entry ------------------------------------------------------
 
 
+def _parse_globs_arg(value: str | None) -> tuple[str, ...]:
+    """U2: `--glob` のカンマ区切り文字列 → tuple.
+
+    空白は trim し、空要素は落とす. 全部空だった場合は空 tuple を返して
+    後段の `_validate_glob_patterns` に任せる (ConfigError(reason="invalid_glob")).
+    """
+    if value is None:
+        return ("*.txt",)
+    parts = tuple(p.strip() for p in value.split(",") if p.strip())
+    return parts
+
+
 def run_ingest(args: argparse.Namespace) -> int:
     quiet = getattr(args, "quiet", False)
     if not quiet:
@@ -803,6 +883,9 @@ def run_ingest(args: argparse.Namespace) -> int:
         show_progress=not (
             getattr(args, "quiet", False) or getattr(args, "no_progress", False)
         ),
+        # U2: 入力探索オプション.
+        recursive=getattr(args, "recursive", False),
+        globs=_parse_globs_arg(getattr(args, "globs", None)),
     )
     # `--force-regenerate` と `--retry-failed` の共存: force 優先、retry は警告
     if cfg.force_regenerate and cfg.retry_failed:

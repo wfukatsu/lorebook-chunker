@@ -4,89 +4,16 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import pytest
 
-from lorebook_chunker.chunker import simple_japanese_splitter
 from lorebook_chunker.ingest import IngestConfig, IngestRunner, run_ingest
 from lorebook_chunker.llm import GenerateResult, LLMPermanentError
-from lorebook_chunker.schema import AnalyzerConfig, EntityMention
+from lorebook_chunker.schema import EntityMention
 
-
-class _StubAnalyzer:
-    """Ginza 非依存の stub. simple_japanese_splitter を使い、固定の NER を返す."""
-
-    def __init__(self, entity_map: dict[str, list[EntityMention]] | None = None) -> None:
-        self._entities = entity_map or {}
-
-    def iter_sentences(self, text: str) -> Iterable[str]:
-        return simple_japanese_splitter(text)
-
-    def iter_entities(self, text: str) -> Iterable[EntityMention]:
-        # 入力 text の最初のキー (substring) がマッチすればそのエンティティを返す
-        for key, ents in self._entities.items():
-            if key in text:
-                yield from ents
-
-    def tokenize_for_tfidf(self, text: str) -> list[str]:
-        # シンプルな tokenization: 句点/空白で分割 + 2 文字以上
-        tokens: list[str] = []
-        for chunk in text.replace("\n", "。").split("。"):
-            for word in chunk.split():
-                w = word.strip("、.,")
-                if len(w) >= 2:
-                    tokens.append(w)
-        # 漢字語も強引に混ぜる (文字ベースの simple tokenizer)
-        for word in ["田中", "佐藤", "スカラー商事", "東京", "大阪", "プロジェクト"]:
-            count = text.count(word)
-            for _ in range(count):
-                tokens.append(word)
-        return tokens
-
-    def save(self, path) -> None:
-        # analyzer.json を書き出す (strict_match / compat_match の最小限)
-        config = AnalyzerConfig(
-            strict_match={
-                "model_name": "stub",
-                "split_mode": "STUB",
-                "pos_allowlist": ["NOUN"],
-                "stopwords": [],
-                "lemma_rules": "stub",
-                "normalization": {"nfkc": True, "lf_only": True, "strip_trailing": True, "collapse_spaces": True},
-                "sudachidict_binary_sha256": "stub",
-                "model_checksum": "stub",
-            },
-            compat_match={"ginza": "stub-0.0", "spacy": "stub-0.0", "sudachipy": "stub-0.0"},
-            tfidf={"min_df": 1, "max_df": 0.95},
-        )
-        Path(path).write_text(
-            json.dumps(config.to_dict(), ensure_ascii=False), encoding="utf-8"
-        )
-
-    def build_config(self) -> AnalyzerConfig:
-        return AnalyzerConfig(
-            strict_match={"model_name": "stub"},
-            compat_match={"ginza": "stub-0.0"},
-            tfidf={},
-        )
-
-
-class _ScriptedLLM:
-    model_id = "mock@v1"
-
-    def __init__(self, responses: list) -> None:
-        self._responses = list(responses)
-        self.calls = 0
-
-    def generate(self, prompt: str, max_tokens: int) -> GenerateResult:
-        self.calls += 1
-        r = self._responses.pop(0) if self._responses else GenerateResult(
-            text="OK", input_tokens=5, output_tokens=5, model_id="mock@v1", finish_reason="end_turn"
-        )
-        if isinstance(r, Exception):
-            raise r
-        return r
+# U2: stub クラスは tests/conftest.py に集約.
+from tests.conftest import _ScriptedLLM, _StubAnalyzer
 
 
 def _ok(text: str = "OK") -> GenerateResult:
