@@ -16,9 +16,11 @@ jobs:
     name: pytest (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     # Hard timeout — prior run hung on transformer weight download for 6h.
-    # 30 min covers normal install + pytest with cold HF cache (~5-10 min real),
-    # while fail-fast on any indefinite hang.
-    timeout-minutes: 30
+    # 40 min covers cold HF fetch (~5 min) + dep install (~3 min) +
+    # full pytest with real GiNZA ELECTRA inference on the 2-CPU runner
+    # (~20 min for 302 tests, several do full IngestRunner cycles).
+    # Subsequent runs hit the HF cache and complete much faster (~10 min total).
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -86,9 +88,14 @@ jobs:
           python -c "from lorebook_chunker.analyzer import JapaneseAnalyzer; a = JapaneseAnalyzer(); print('GiNZA ELECTRA loaded; tokenizer ready')"
 
       - name: Run pytest
-        # Pytest itself capped at 15 min; on cache hit + warm Python this is
-        # ~1 min on a healthy runner.
-        timeout-minutes: 15
+        # Pytest cap: 30 min. Tight reasoning:
+        # - test_bench TestEvaluateRun + test_smoke run real IngestRunner
+        #   cycles (no stub analyzer) — each ~30-50s on a 2-CPU runner doing
+        #   CPU-only ELECTRA inference. Several dozen such tests.
+        # - On warm HF cache + warm Python this drops to <5 min total.
+        # If a test individually hangs, it's the runner spec problem; we'd
+        # see exit at 30 min instead of 6h.
+        timeout-minutes: 30
         run: pytest tests/ -v
         env:
           PYTHONDONTWRITEBYTECODE: "1"
