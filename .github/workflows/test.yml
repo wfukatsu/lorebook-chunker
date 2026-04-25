@@ -75,9 +75,15 @@ jobs:
         # Force the transformer download to happen as a discrete, time-bounded
         # step. If it hangs here we fail fast (10 min) instead of timing out
         # mid-pytest after 30 min. Subsequent runs hit the actions/cache hit.
+        #
+        # Use JapaneseAnalyzer (not bare spacy.load) because Ginza 5.2 ships
+        # `compound_splitter.split_mode = None` which fails spaCy 3.8 Config
+        # validation (`None is not <class 'str'>`). JapaneseAnalyzer applies
+        # the runtime config override that bypasses this. See README §Ginza
+        # 5.2 × spacy 3.8 互換シム.
         timeout-minutes: 10
         run: |
-          python -c "import spacy; nlp = spacy.load('ja_ginza_electra'); print('GiNZA ELECTRA loaded:', nlp.meta.get('name'))"
+          python -c "from lorebook_chunker.analyzer import JapaneseAnalyzer; a = JapaneseAnalyzer(); print('GiNZA ELECTRA loaded; tokenizer ready')"
 
       - name: Run pytest
         # Pytest itself capped at 15 min; on cache hit + warm Python this is
