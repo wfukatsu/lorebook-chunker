@@ -25,24 +25,8 @@ from lorebook_chunker.wiki import (
 
 
 # ---- Mock LLM client -------------------------------------------------
-
-
-class _ScriptedLLMClient:
-    """呼び出し順に応じて固定レスポンス or 例外を返す mock."""
-
-    def __init__(self, script: list, model_id: str = "mock@v1") -> None:
-        self.model_id = model_id
-        self._script = list(script)
-        self.call_count = 0
-        self.prompts: list[str] = []
-
-    def generate(self, prompt: str, max_tokens: int) -> GenerateResult:
-        self.call_count += 1
-        self.prompts.append(prompt)
-        action = self._script.pop(0) if self._script else _success("OK")
-        if isinstance(action, Exception):
-            raise action
-        return action
+# U2: `_ScriptedLLMClient` は tests/conftest.py に移動.
+from tests.conftest import _ScriptedLLMClient  # noqa: E402
 
 
 def _success(text: str, finish: str = "end_turn", out_tokens: int = 20) -> GenerateResult:

@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,17 @@ from typing import Any, Callable, Iterable, NoReturn, Protocol
 
 from lorebook_chunker.chunker import Chunker
 from lorebook_chunker.cli import IDENTITY_BANNER
+from lorebook_chunker.encoding import detect_encoding
+from lorebook_chunker.errors import (
+    AnalyzerInitError,
+    AtomicSwapError,
+    ConfigError,
+    EncodingError,
+    LLMBackendUnavailableError,
+    LorebookError,
+    WikiGenerationError,
+    ZeroChunksError,
+)
 from lorebook_chunker.llm import LLMClient, LLMPermanentError, get_client
 from lorebook_chunker.ner import (
     AggregationStats,
@@ -27,8 +39,9 @@ from lorebook_chunker.ner import (
 )
 from lorebook_chunker.normalize import normalize_text
 from lorebook_chunker.progress import ProgressReporter
-from lorebook_chunker.schema import ChunkRecord
+from lorebook_chunker.schema import ChunkRecord, SkipReport
 from lorebook_chunker.tfidf import TfidfBuilder
+from lorebook_chunker._swap import atomic_swap as _swap_atomic_swap
 from lorebook_chunker.wiki import (
     WikiGenerator,
     WikiGeneratorConfig,
@@ -234,6 +247,22 @@ class IngestConfig:
     device: str = "cpu"
     # 進捗表示 (stderr). --quiet で False, CLI で明示的に --no-progress が付けば False.
     show_progress: bool = True
+    # U2: 入力探索. recursive=True なら rglob, それ以外は glob.
+    # globs は default ("*.txt",) で後方互換. tuple なら内部 API から直接指定可能、
+    # CLI から渡すときは cli.py 側でカンマ区切り文字列をタプルに parse する.
+    recursive: bool = False
+    globs: tuple[str, ...] = ("*.txt",)
+    # U3: エンコーディング. "auto" (既定) で staged detection (utf-8-sig →
+    # charset-normalizer → EncodingError). 明示指定した文字列は strict decode.
+    encoding: str = "auto"
+    # U6: post-swap で staging/target の SHA-256 manifest 照合を行う opt-in
+    # フラグ. 同一 FS 上では os.replace が inode 操作のため pre/post hash は
+    # tautologically 一致する. 主な検出価値は EXDEV fallback 経路および
+    # I/O 層の稀な破損. 詳細は README「Atomic swap contract」.
+    verify_swap: bool = False
+    # U7: --dry-run. True の場合 IngestRunner.run() は doctor + 入力探索 +
+    # 先頭ファイル encoding probe のみ実行し、output_dir は作成しない.
+    dry_run: bool = False
 
 
 def _resolve_wiki_parallelism(
@@ -258,11 +287,37 @@ def _resolve_wiki_parallelism(
 class IngestResult:
     exit_code: int
     warnings: list[str] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)
+    # U1: errors は LorebookError.to_jsonable() 出力 (dict) または
+    # unclassified Exception を表す dict。旧 format (文字列) は廃止し、
+    # run_report.json への machine-readable dump を容易にする。
+    errors: list[dict[str, Any]] = field(default_factory=list)
     chunks_generated: int = 0
     total_input_files: int = 0
-    skipped_files: int = 0
+    # U4: 構造化された skip レコード. `len(skips)` が旧 `skipped_files` int と
+    # 互換. 外部 caller は `result.skipped_files` (property) を読むだけで従来
+    # どおり int カウントを取得できる. mutation は `result.skips.append(...)`
+    # 経由で行う.
+    skips: list[SkipReport] = field(default_factory=list)
     wiki_stats: WikiStats | None = None
+    # U5: 6 stable phase name (analyzer_init / chunking / tfidf / ner / wiki / swap)
+    # → duration seconds の dict. IngestRunner.run の末尾で
+    # `progress.phase_timings()` から写される. 失敗 phase も finally 経由で
+    # 記録される (wiki で例外発生 → wiki の duration は >0 で残る).
+    phase_timings: dict[str, float] = field(default_factory=dict)
+    # U5: NER 集計で閾値通過したユニークエンティティ数 (AggregationStats.accepted_entities).
+    # 現状は log.md にしか出ないので run_report.json 用に持ち上げる.
+    entities_generated: int = 0
+
+    @property
+    def skipped_files(self) -> int:
+        """U4: `len(self.skips)` の後方互換 alias.
+
+        旧 `IngestResult` には `skipped_files: int` フィールドがあり、一部の
+        call-site (tests / CLI summary / log.md) は read 専用で参照していた.
+        U4 で構造化 `skips` を導入した後も read 側契約を維持するための
+        derived property.
+        """
+        return len(self.skips)
 
 
 # ---- Runner -----------------------------------------------------------
@@ -283,40 +338,85 @@ class IngestRunner:
     def run(self) -> IngestResult:
         result = IngestResult(exit_code=0)
         progress = ProgressReporter(enabled=self.cfg.show_progress)
-        input_files = _collect_input_files(self.cfg.input_dir)
-        result.total_input_files = len(input_files)
-        if not input_files:
-            result.exit_code = 2
-            result.errors.append(
-                f"no .txt files under {self.cfg.input_dir}"
-            )
-            return result
-        progress.info(
-            f"{len(input_files)} files / backend={self.cfg.analyzer_backend} "
-            f"device={self.cfg.device}"
-        )
+        # staging は外側 try/finally で cleanup するため、try の外で宣言する.
+        staging: Path | None = None
+        # U5: 現在「通過中」の phase 名と開始時刻を保持する.
+        # `_begin_phase(name)` で start、正常通過時は `_end_phase()` で記録、
+        # 例外時は outermost except/finally で `_end_phase(force=True)` を
+        # 呼び、失敗 phase の partial duration を残す.
+        _active_phase: list[str | None] = [None]
+        _active_phase_t0: list[float] = [0.0]
 
-        # 早期 fail-fast: LLM バックエンド生成 (OpenAI なら即例外)
-        if not self.cfg.skip_wiki:
-            llm_config: dict[str, Any] = {}
-            if self.cfg.llm_model:
-                llm_config["model"] = self.cfg.llm_model
-            try:
-                llm = self._llm_factory(self.cfg.llm_backend, llm_config)
-            except LLMPermanentError as e:
-                result.exit_code = 3
-                result.errors.append(f"LLM backend unavailable: {e}")
-                return result
-        else:
-            llm = _NoopLLM()
+        def _begin_phase(name: str) -> None:
+            _active_phase[0] = name
+            _active_phase_t0[0] = time.perf_counter()
 
-        # staging dir
-        staging = self.cfg.output_dir.with_name(self.cfg.output_dir.name + ".staging")
-        if staging.exists():
-            shutil.rmtree(staging)
-        staging.mkdir(parents=True, exist_ok=False)
+        def _end_phase() -> None:
+            if _active_phase[0] is not None:
+                progress._record_duration(
+                    _active_phase[0], time.perf_counter() - _active_phase_t0[0]
+                )
+                _active_phase[0] = None
 
         try:
+            # U3: encoding 引数の妥当性を早期検証. "auto" 以外は Python codec
+            # 名として解決可能でなければ ConfigError (exit 2).
+            _validate_encoding_option(self.cfg.encoding)
+
+            input_files = _collect_input_files(
+                self.cfg.input_dir,
+                globs=self.cfg.globs,
+                recursive=self.cfg.recursive,
+            )
+            result.total_input_files = len(input_files)
+            if not input_files:
+                # U1: "設定が入力を生まなかった" は ConfigError (exit 2).
+                # 既存テストが assert する "no .txt" substring を message 冒頭に
+                # 残しつつ、context に structured な値を持たせる.
+                # default globs ("*.txt",) 時は従来どおり "no .txt files" 表示.
+                label = (
+                    ".txt"
+                    if tuple(self.cfg.globs) == ("*.txt",)
+                    else ", ".join(self.cfg.globs)
+                )
+                raise ConfigError(
+                    f"no {label} files under {self.cfg.input_dir}",
+                    reason="no_input_files",
+                    input_dir=str(self.cfg.input_dir),
+                    globs=list(self.cfg.globs),
+                    recursive=self.cfg.recursive,
+                )
+            progress.info(
+                f"{len(input_files)} files / backend={self.cfg.analyzer_backend} "
+                f"device={self.cfg.device}"
+            )
+
+            # 早期 fail-fast: LLM バックエンド生成 (OpenAI なら即例外)
+            if not self.cfg.skip_wiki:
+                llm_config: dict[str, Any] = {}
+                if self.cfg.llm_model:
+                    llm_config["model"] = self.cfg.llm_model
+                try:
+                    llm = self._llm_factory(self.cfg.llm_backend, llm_config)
+                except LLMPermanentError as e:
+                    # preflight の LLM 初期化失敗 → exit 3 (既存契約).
+                    # LLMPermanentError 自体は LorebookError 派生だが exit code
+                    # は 10 なので、ここで明示的に LLMBackendUnavailableError
+                    # にラップする (preflight vs runtime の区別を保つ).
+                    raise LLMBackendUnavailableError(
+                        f"LLM backend unavailable: {e}",
+                        backend=self.cfg.llm_backend,
+                        reason=type(e).__name__,
+                    ) from e
+            else:
+                llm = _NoopLLM()
+
+            # staging dir
+            staging = self.cfg.output_dir.with_name(self.cfg.output_dir.name + ".staging")
+            if staging.exists():
+                shutil.rmtree(staging)
+            staging.mkdir(parents=True, exist_ok=False)
+
             # 1. 既存 output_dir から manifest を読む
             existing_manifest = self.cfg.output_dir / "entities" / "manifest.json"
             # staging 側の entities/manifest.json に pre-populate する (wiki generator が load するので)
@@ -333,16 +433,31 @@ class IngestRunner:
                         shutil.copy2(md, staging / "entities" / md.name)
 
             # 2. analyzer をロード or 新規生成
+            # U5: analyzer_init phase boundary.
             existing_analyzer = self.cfg.output_dir / "analyzer.json"
             progress.info("analyzer 初期化中 (spaCy / モデルロード)...")
+            _begin_phase("analyzer_init")
             try:
                 analyzer = self._analyzer_factory(existing_analyzer if existing_analyzer.exists() else None)
+            except LorebookError:
+                # すでに分類済み (AnalyzerInitError 派生の
+                # AnalyzerVersionMismatchError / AnalyzerNEUnavailableError 等)
+                # はそのまま伝播させる.
+                raise
             except Exception as e:
-                result.exit_code = 4
-                result.errors.append(f"analyzer init failed: {e}")
-                return result
+                # 未分類の runtime error を AnalyzerInitError (exit 4) に wrap.
+                raise AnalyzerInitError(
+                    f"analyzer init failed: {e}",
+                    reason="init_exception",
+                    cause=type(e).__name__,
+                ) from e
+            _end_phase()
 
             # 3. 入力正規化 + チャンク化
+            # U5: chunking phase boundary. ZeroChunksError / 単一パス解析での
+            # 例外はすべて outermost except で捕捉され、`_end_phase(force=True)`
+            # 相当の finally で partial duration が記録される.
+            _begin_phase("chunking")
             chunker = Chunker(
                 splitter=analyzer.iter_sentences,
                 target_chars=self.cfg.target_chars,
@@ -351,16 +466,69 @@ class IngestRunner:
             )
             pipe_batch_size, pipe_n_process = _resolve_pipe_config(device=self.cfg.device)
             # 3a. ファイル読み込み + normalize (CPU 軽い) を先に一括で済ませる.
+            # U3: `detect_encoding` で staged detection (utf-8-sig → charset-normalizer).
+            # U4: skip 発生時は `result.skips` に構造化 `SkipReport` を append し、
+            # 後段で `skipped_files.jsonl` として emit する. 既存テストが assertion
+            # している warning 文字列 ("empty file" / "utf-8 decode failed") は
+            # log.md 互換のため result.warnings にも同内容を残す.
             file_records: list[tuple[Path, str, str]] = []  # (path, relative, normalized)
             for file_path in input_files:
                 try:
-                    raw = file_path.read_text(encoding="utf-8")
-                except UnicodeDecodeError:
-                    result.skipped_files += 1
+                    raw, _actual_encoding = detect_encoding(
+                        file_path, override=self.cfg.encoding
+                    )
+                except EncodingError as e:
+                    result.skips.append(_skip_report_from_encoding_error(file_path, e))
                     result.warnings.append(f"utf-8 decode failed, skipped: {file_path}")
                     continue
+                except UnicodeDecodeError as e:
+                    # detect_encoding は EncodingError に wrap する設計だが、
+                    # 将来的な変更 / monkeypatch 経由の直接 raise に備えた safety net.
+                    result.skips.append(
+                        SkipReport(
+                            path=str(file_path),
+                            reason="encoding_decode_failed",
+                            detail=str(e),
+                            encoding_attempted=getattr(e, "encoding", None),
+                            size_bytes=_safe_stat_size(file_path),
+                        )
+                    )
+                    result.warnings.append(f"utf-8 decode failed, skipped: {file_path}")
+                    continue
+                except FileNotFoundError as e:
+                    result.skips.append(
+                        SkipReport(
+                            path=str(file_path),
+                            reason="file_not_found",
+                            detail=str(e),
+                            encoding_attempted=None,
+                            size_bytes=None,
+                        )
+                    )
+                    result.warnings.append(f"file not found, skipped: {file_path}")
+                    continue
+                except PermissionError as e:
+                    result.skips.append(
+                        SkipReport(
+                            path=str(file_path),
+                            reason="permission_denied",
+                            detail=str(e),
+                            encoding_attempted=None,
+                            size_bytes=_safe_stat_size(file_path),
+                        )
+                    )
+                    result.warnings.append(f"permission denied, skipped: {file_path}")
+                    continue
                 if not raw.strip():
-                    result.skipped_files += 1
+                    result.skips.append(
+                        SkipReport(
+                            path=str(file_path),
+                            reason="empty_file",
+                            detail=None,
+                            encoding_attempted=None,
+                            size_bytes=_safe_stat_size(file_path),
+                        )
+                    )
                     result.warnings.append(f"empty file, skipped: {file_path}")
                     continue
                 normalized = normalize_text(raw)
@@ -422,14 +590,24 @@ class IngestRunner:
                 chunk.row_index = i
 
             if not all_chunks:
-                result.exit_code = 5
-                result.errors.append("chunking produced 0 chunks")
-                return result
+                raise ZeroChunksError(
+                    "chunking produced 0 chunks",
+                    reason="zero_chunks",
+                    total_input_files=result.total_input_files,
+                    skipped_files=result.skipped_files,
+                )
+            _end_phase()  # U5: chunking phase 終了
 
             # 4-5. TF-IDF + NER
             # 単一パス path: ファイル単位 DocumentAnalysis から chunk 範囲でスライス.
             # 旧 Doc API path: 全 chunk text を改めて nlp.pipe に流す (ELECTRA 2 回目).
             # stub path: iter_sentences / iter_entities / tokenize_for_tfidf を個別呼び出し.
+            # U5: tfidf phase boundary. inner progress.start/end calls in
+            # `_slice_single_pass` / `_compute_tokens_and_entities_via_pipe`
+            # は `_durations` には触らず、outer phase の記録と独立に動く
+            # (それぞれ別キーで上書きされる可能性はあるが、stable key としては
+            #  "tfidf" と別の日本語名なので競合しない).
+            _begin_phase("tfidf")
             tfidf = TfidfBuilder(
                 analyzer=analyzer.tokenize_for_tfidf,
                 top_keywords=self.cfg.top_keywords,
@@ -466,15 +644,22 @@ class IngestRunner:
             keywords = tfidf.top_keywords_per_chunk(matrix, vocab)
             for chunk, kws in zip(all_chunks, keywords):
                 chunk.top_keywords = kws
+            _end_phase()  # U5: tfidf phase 終了
 
             attach_entities_to_chunks(all_chunks, entities_per_chunk)
             progress.info("エンティティ集計中...")
+            # U5: ner phase boundary.
+            _begin_phase("ner")
             aggregates, agg_stats = aggregate_entities(
                 all_chunks,
                 entities_per_chunk,
                 min_mentions=self.cfg.min_mentions,
                 min_chunks=self.cfg.min_chunks,
             )
+            # U5: entities_generated を IngestResult に持ち上げ
+            # (現在は log.md にしか出ない AggregationStats.accepted_entities).
+            result.entities_generated = agg_stats.accepted_entities
+            _end_phase()  # U5: ner phase 終了
 
             # 6. 書き出し: analyzer.json / vocab.npz / chunks.jsonl
             progress.info(
@@ -489,6 +674,9 @@ class IngestRunner:
                     f.write("\n")
 
             # 7. エンティティ wiki
+            # U5: wiki phase boundary. `--skip-wiki` 時も 0 秒で begin/end を
+            # 通すことで、stable key set ("wiki": 0.0) を維持する.
+            _begin_phase("wiki")
             wiki_stats = WikiStats()
             if not self.cfg.skip_wiki:
                 wiki_parallelism = _resolve_wiki_parallelism(
@@ -519,14 +707,21 @@ class IngestRunner:
                 try:
                     wiki_stats = wiki.generate_all(aggregates)
                 except LLMPermanentError as e:
-                    result.exit_code = 6
-                    result.errors.append(f"wiki generation aborted: {e}")
                     # F-015: systemic-abort 時は staging の manifest を sibling dir に退避.
                     _preserve_failed_manifest(self.cfg.output_dir, staging)
-                    return result
+                    # runtime wiki 失敗 → exit 6. preflight 失敗 (exit 3) と
+                    # 区別するため WikiGenerationError にラップする.
+                    # U5: phase duration は outermost except → finally で
+                    # `_end_phase()` が呼ばれて記録されるため、ここで `_end_phase()`
+                    # を呼ばなくても wiki の partial duration は残る.
+                    raise WikiGenerationError(
+                        f"wiki generation aborted: {e}",
+                        reason=type(e).__name__,
+                    ) from e
 
                 # 8. index.md (--skip-wiki 時には作らない — F-009)
                 _write_index_md(staging / "index.md", staging / "entities" / "manifest.json")
+            _end_phase()  # U5: wiki phase 終了 (skip_wiki=True でも記録)
 
             # 9. log.md
             _append_log_md(
@@ -541,30 +736,194 @@ class IngestRunner:
                 llm_model=getattr(llm, "model_id", "noop"),
             )
 
+            # U4: skipped_files.jsonl (skip 0 件なら作成しない).
+            # staging に書き出して atomic swap と一緒に公開する.
+            if result.skips:
+                _write_skipped_files_jsonl(
+                    staging / "skipped_files.jsonl", result.skips
+                )
+
             # 10. atomic swap
-            _atomic_swap(self.cfg.output_dir, staging)
+            # U5: swap phase boundary.
+            _begin_phase("swap")
+            _atomic_swap(self.cfg.output_dir, staging, verify=self.cfg.verify_swap)
+            _end_phase()
             result.chunks_generated = len(all_chunks)
             result.wiki_stats = wiki_stats
+            # U5: 最終段で phase_timings を result に写す.
+            result.phase_timings = progress.phase_timings()
+            return result
+        except LorebookError as e:
+            # U1: typed LorebookError は e.exit_code を respect. context と
+            # class 名は to_jsonable() で machine-readable に記録する.
+            # U5: 失敗 phase の partial duration を記録する (try/finally 相当).
+            _end_phase()
+            result.exit_code = e.exit_code
+            result.errors.append(e.to_jsonable())
+            result.phase_timings = progress.phase_timings()
             return result
         except Exception as e:
+            # U1: 未分類例外は exit 10 fallback. class 名だけは残す.
+            # U5: 失敗 phase の partial duration を記録する.
+            _end_phase()
             logger.exception("ingest failed")
             result.exit_code = 10
-            result.errors.append(f"ingest failure: {e}")
+            result.errors.append(
+                {
+                    "class": type(e).__name__,
+                    "message": f"ingest failure: {e}",
+                    "context": {},
+                }
+            )
+            result.phase_timings = progress.phase_timings()
             return result
         finally:
             # F-005/F-058: 早期 return (exit_code 5/6/10 等) 時にも staging をクリーンアップ.
             # atomic swap が成功した場合は staging は既に rename 済みで存在しない.
-            if staging.exists():
+            if staging is not None and staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)
 
 
 # ---- helpers --------------------------------------------------------
 
 
-def _collect_input_files(input_dir: Path) -> list[Path]:
+# U4: EncodingError.context の reason 値のうち「auto 検出の失敗」系を
+# encoding_detection_failed に分類、それ以外は encoding_decode_failed 扱い.
+_DETECTION_FAILURE_REASONS: frozenset[str] = frozenset(
+    {
+        "detection_ambiguous",
+        "too_short_to_detect",
+        "utf8_failed_detector_unavailable",
+    }
+)
+
+
+def _safe_stat_size(path: Path) -> int | None:
+    """`path.stat().st_size` を best-effort で取得. OSError なら None."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def _skip_report_from_encoding_error(
+    path: Path, exc: EncodingError
+) -> SkipReport:
+    """`EncodingError` を SkipReport に translate する (U3 の context を活用)."""
+    context = exc.context or {}
+    ctx_reason = context.get("reason")
+    reason = (
+        "encoding_detection_failed"
+        if ctx_reason in _DETECTION_FAILURE_REASONS
+        else "encoding_decode_failed"
+    )
+    encoding_attempted = (
+        context.get("encoding_attempted")
+        or context.get("encoding")
+        or context.get("tried")
+    )
+    size_bytes = context.get("size_bytes")
+    if size_bytes is None:
+        size_bytes = _safe_stat_size(path)
+    return SkipReport(
+        path=str(path),
+        reason=reason,
+        detail=str(exc),
+        encoding_attempted=encoding_attempted,
+        size_bytes=size_bytes,
+    )
+
+
+def _write_skipped_files_jsonl(path: Path, skips: list[SkipReport]) -> None:
+    """U4: skipped_files.jsonl を staging dir 内に書き出す.
+
+    `skips` が空なら呼び出し側で skip されるべきだが、safety net として空でも
+    書き出さない (出力 dir を clean に保つ plan Approach).
+    """
+    if not skips:
+        return
+    with path.open("w", encoding="utf-8") as f:
+        for sr in skips:
+            f.write(json.dumps(sr.to_jsonable(), ensure_ascii=False))
+            f.write("\n")
+
+
+def _validate_encoding_option(encoding: str) -> None:
+    """U3: `--encoding` の妥当性を早期チェック.
+
+    - `"auto"` は detect_encoding の staged pipeline を意味するため pass.
+    - それ以外は `codecs.lookup()` で Python codec 名として解決可能であるこ
+      とを要求. 解決不能なら `ConfigError(reason="invalid_encoding")` (exit 2).
+    """
+    if encoding == "auto":
+        return
+    import codecs as _codecs
+    try:
+        _codecs.lookup(encoding)
+    except LookupError as exc:
+        raise ConfigError(
+            f"invalid encoding name: {encoding!r}",
+            reason="invalid_encoding",
+            encoding=encoding,
+        ) from exc
+
+
+def _validate_glob_patterns(globs: tuple[str, ...]) -> None:
+    """U2: glob pattern の前提 (non-empty / relative / no path separator 開始) を検証.
+
+    違反時は `ConfigError(reason="invalid_glob")` を raise. recursive discovery でも
+    `rglob` に絶対パスや path-separator 開始は渡せないため、ここで早期に弾く.
+    """
+    if not globs:
+        raise ConfigError(
+            "at least one --glob pattern is required",
+            reason="invalid_glob",
+            pattern="",
+        )
+    for pattern in globs:
+        if not pattern:
+            raise ConfigError(
+                "empty --glob pattern is not allowed",
+                reason="invalid_glob",
+                pattern=pattern,
+            )
+        p = Path(pattern)
+        if p.is_absolute() or pattern.startswith(("/", os.sep)):
+            raise ConfigError(
+                f"absolute --glob pattern is not allowed: {pattern!r}",
+                reason="invalid_glob",
+                pattern=pattern,
+            )
+
+
+def _collect_input_files(
+    input_dir: Path,
+    *,
+    globs: tuple[str, ...] = ("*.txt",),
+    recursive: bool = False,
+) -> list[Path]:
+    """U2: recursive/pattern 対応の入力ファイル収集.
+
+    - `recursive=True` なら `rglob`、False なら `glob`
+    - 各 pattern を iterate しつつ `resolve()` 済みパスで dedupe
+    - 昇順 sort で決定論的順序を返す
+    - pattern 妥当性は caller からも使えるよう `_validate_glob_patterns` で検証
+    """
+    _validate_glob_patterns(globs)
     if not input_dir.exists() or not input_dir.is_dir():
         return []
-    return sorted(input_dir.glob("*.txt"))
+    seen: dict[Path, Path] = {}
+    for pattern in globs:
+        iterator = (
+            input_dir.rglob(pattern) if recursive else input_dir.glob(pattern)
+        )
+        for path in iterator:
+            if not path.is_file():
+                continue
+            key = path.resolve()
+            if key not in seen:
+                seen[key] = path
+    return sorted(seen.values())
 
 
 def _ginza_model_version(analyzer: IngestAnalyzer) -> str:
@@ -599,29 +958,36 @@ def _preserve_failed_manifest(output_dir: Path, staging: Path) -> None:
         logger.warning("failed to preserve manifest for inspection: %s", e)
 
 
-def _atomic_swap(target: Path, staging: Path) -> None:
-    """target を staging の内容で置き換える. 途中キャンセル耐性は best-effort.
+def _atomic_swap(target: Path, staging: Path, *, verify: bool = False) -> None:
+    """target を staging の内容で置き換える (U6: `_swap.atomic_swap` に委譲).
 
-    手順:
-      1. target が存在するなら target.with_suffix('.backup') に move
-      2. staging を target に rename
-      3. backup を削除
+    本関数は U5 の swap phase boundary と IngestRunner 呼び出し箇所を
+    変えないための thin wrapper. 実装は `lorebook_chunker._swap.atomic_swap`
+    に切り出されており、そちらが以下を担保する:
+
+    - 同一 FS 上: `os.replace` で atomic swap
+    - EXDEV: `<target>.swap-tmp/` 経由で `shutil.copytree` + `os.replace`
+    - 親ディレクトリ fsync (best-effort, tmpfs は warning + 継続)
+    - `verify=True` で SHA-256 manifest を staging 側に書き出し、swap 後に
+      target 側と照合する opt-in チェック
+    - `AtomicSwapError` (exit 16) で失敗系を統一
+
+    ここでは belt-and-suspenders として、`_swap` が `AtomicSwapError` に
+    分類しなかった uncaught `OSError` も exit 16 に拾い上げる.
     """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    backup: Path | None = None
-    if target.exists():
-        backup = target.with_name(target.name + ".backup")
-        if backup.exists():
-            shutil.rmtree(backup)
-        target.rename(backup)
     try:
-        staging.rename(target)
-    except OSError:
-        # rename が跨ぎで失敗する場合は copytree + rmtree
-        shutil.copytree(staging, target)
-        shutil.rmtree(staging)
-    if backup is not None and backup.exists():
-        shutil.rmtree(backup)
+        _swap_atomic_swap(target, staging, verify=verify)
+    except AtomicSwapError:
+        # 下位で正しく翻訳済み. そのまま再送.
+        raise
+    except OSError as e:
+        raise AtomicSwapError(
+            f"atomic swap failed: {e}",
+            reason=type(e).__name__,
+            errno=getattr(e, "errno", None) or 0,
+            source=str(staging),
+            target=str(target),
+        ) from e
 
 
 def _write_index_md(path: Path, manifest_path: Path) -> None:
@@ -717,22 +1083,211 @@ class _NoopLLM:
 # ---- CLI entry ------------------------------------------------------
 
 
-INGEST_EXIT_CODES = """\
-exit codes:
-  0  success
-  2  no input .txt files under input_dir
-  3  LLM backend unavailable (permanent error at init)
-  4  analyzer init failed
-  5  chunking produced zero chunks
-  6  wiki generation aborted (systemic failure detected)
-  10 unexpected error (see log / stderr)
-"""
+def _parse_globs_arg(value: str | None) -> tuple[str, ...]:
+    """U2: `--glob` のカンマ区切り文字列 → tuple.
+
+    空白は trim し、空要素は落とす. 全部空だった場合は空 tuple を返して
+    後段の `_validate_glob_patterns` に任せる (ConfigError(reason="invalid_glob")).
+    """
+    if value is None:
+        return ("*.txt",)
+    parts = tuple(p.strip() for p in value.split(",") if p.strip())
+    return parts
+
+
+def _build_analyzer_meta(output_dir: Path) -> dict[str, Any]:
+    """`output_dir/analyzer.json` から RunReport.analyzer フィールドを構築する.
+
+    ingest 失敗で analyzer.json が書き出されなかった場合 (analyzer_init 失敗
+    / chunking ZeroChunks 前に swap 未実行) は既定値で埋める. schema key set
+    は常に同じ 6 フィールドを emit して stable にする.
+
+    Fields:
+      model_name / model_version / model_sha256 / spacy_version / ginza_version / sudachi_dict
+    """
+    ap = output_dir / "analyzer.json"
+    meta: dict[str, Any] = {
+        "model_name": "",
+        "model_version": "",
+        "model_sha256": "",
+        "spacy_version": "",
+        "ginza_version": "",
+        "sudachi_dict": "",
+    }
+    if not ap.exists():
+        return meta
+    try:
+        data = json.loads(ap.read_text(encoding="utf-8"))
+        from lorebook_chunker.wiki import compute_analyzer_json_hash
+
+        strict = data.get("strict_match") or {}
+        compat = data.get("compat_match") or {}
+        meta["model_name"] = str(strict.get("model_name", ""))
+        # Ginza 系モデルでは model_version は ginza package version と同一.
+        meta["model_version"] = str(compat.get("ginza", ""))
+        try:
+            meta["model_sha256"] = compute_analyzer_json_hash(ap)
+        except Exception:  # pragma: no cover
+            meta["model_sha256"] = ""
+        meta["spacy_version"] = str(compat.get("spacy", ""))
+        meta["ginza_version"] = str(compat.get("ginza", ""))
+        dict_pkg = compat.get("sudachidict_package", "")
+        dict_ver = compat.get("sudachidict_package_version", "")
+        if dict_pkg and dict_ver:
+            meta["sudachi_dict"] = f"{dict_pkg} {dict_ver}"
+        elif dict_pkg:
+            meta["sudachi_dict"] = str(dict_pkg)
+        elif dict_ver:
+            meta["sudachi_dict"] = str(dict_ver)
+    except (json.JSONDecodeError, OSError):  # pragma: no cover - corrupt / io
+        pass
+    return meta
+
+
+def _run_dry_run(args: argparse.Namespace, *, quiet: bool) -> int:
+    """U7: ``ingest --dry-run`` の本体.
+
+    手順:
+      1. doctor の環境 check を実行. failures があれば 18 を propagate (ingest
+         の exit code 空間 (2-17) には remap しない — doctor の空間 (0/1/18)
+         を尊重する, plan Key Technical Decisions 参照).
+      2. 入力探索 (recursive / glob 適用). ConfigError なら exit 2.
+      3. 先頭ファイルの先頭 64 KiB を bytes で読み、``detect_encoding_bytes``
+         で encoding を probe.
+      4. 結果を JSON で stdout に出力. ``output_dir`` は作成しない.
+    """
+    from lorebook_chunker.doctor import DoctorConfig, run_checks
+    from lorebook_chunker.encoding import detect_encoding_bytes
+
+    # --- 1. doctor preflight ---
+    doctor_cfg = DoctorConfig(
+        backend=getattr(args, "llm_backend", None) if not getattr(
+            args, "skip_wiki", False
+        ) else None,
+        output_dir=Path(args.output_dir) if getattr(args, "output_dir", None) else None,
+        json_output=True,  # --dry-run は常に JSON 出力 (stdout-only)
+        quiet=True,
+    )
+    doctor_summary = run_checks(doctor_cfg)
+    if doctor_summary.failures > 0:
+        # doctor の exit 18 を propagate. 結果 JSON も含めて stdout に出す.
+        out = {
+            "dry_run": True,
+            "doctor_summary": doctor_summary.to_jsonable(),
+            "doctor_exit_code": doctor_summary.exit_code,
+            "note": (
+                "doctor returned env-critical failure (exit 18). "
+                "ingest skipped."
+            ),
+        }
+        print(json.dumps(out, ensure_ascii=False))
+        return doctor_summary.exit_code
+
+    # --- 2. 入力探索 ---
+    input_dir = Path(args.input_dir)
+    globs = _parse_globs_arg(getattr(args, "globs", None))
+    recursive = bool(getattr(args, "recursive", False))
+    encoding_option = getattr(args, "encoding", "auto")
+
+    # encoding 引数の妥当性を早期検証 (ingest runner と同じ strictness).
+    try:
+        _validate_encoding_option(encoding_option)
+    except ConfigError as e:
+        err_payload = {
+            "dry_run": True,
+            "doctor_summary": doctor_summary.to_jsonable(),
+            "error": e.to_jsonable(),
+        }
+        print(json.dumps(err_payload, ensure_ascii=False))
+        return e.exit_code
+
+    try:
+        input_files = _collect_input_files(
+            input_dir, globs=globs, recursive=recursive
+        )
+    except ConfigError as e:
+        err_payload = {
+            "dry_run": True,
+            "doctor_summary": doctor_summary.to_jsonable(),
+            "error": e.to_jsonable(),
+        }
+        print(json.dumps(err_payload, ensure_ascii=False))
+        return e.exit_code
+
+    if not input_files:
+        # ConfigError の no_input_files (既存 ingest と同じ契約).
+        label = (
+            ".txt"
+            if tuple(globs) == ("*.txt",)
+            else ", ".join(globs)
+        )
+        e = ConfigError(
+            f"no {label} files under {input_dir}",
+            reason="no_input_files",
+            input_dir=str(input_dir),
+            globs=list(globs),
+            recursive=recursive,
+        )
+        err_payload = {
+            "dry_run": True,
+            "doctor_summary": doctor_summary.to_jsonable(),
+            "error": e.to_jsonable(),
+        }
+        print(json.dumps(err_payload, ensure_ascii=False))
+        return e.exit_code
+
+    # --- 3. 先頭ファイルの encoding probe ---
+    sample_size = 64 * 1024
+    first = input_files[0]
+    probe: dict[str, Any] = {
+        "path": str(first),
+        "encoding": None,
+        "sample_bytes_examined": 0,
+    }
+    try:
+        with first.open("rb") as fh:
+            sample = fh.read(sample_size)
+        probe["sample_bytes_examined"] = len(sample)
+        _text, enc_name = detect_encoding_bytes(sample, override=encoding_option)
+        probe["encoding"] = enc_name
+    except OSError as exc:
+        probe["encoding"] = "read_failed"
+        probe["detail"] = str(exc)
+
+    out_dir_will_be = str(Path(args.output_dir))
+
+    # --- 4. JSON summary を stdout に emit ---
+    summary_dict = {
+        "dry_run": True,
+        "doctor_summary": doctor_summary.to_jsonable(),
+        "files_discovered": len(input_files),
+        "first_file_path": str(first),
+        "first_file_encoding_probe": probe,
+        "output_dir_will_be": out_dir_will_be,
+        "output_dir_created": False,
+        "input": {
+            "input_dir": str(input_dir),
+            "recursive": recursive,
+            "globs": list(globs),
+            "encoding_option": encoding_option,
+        },
+    }
+    print(json.dumps(summary_dict, ensure_ascii=False))
+    return 0
 
 
 def run_ingest(args: argparse.Namespace) -> int:
     quiet = getattr(args, "quiet", False)
-    if not quiet:
+    if not quiet and not getattr(args, "dry_run", False):
         print(IDENTITY_BANNER, file=sys.stderr)
+
+    # U7: --dry-run は IngestRunner を構築せずに早期 return する.
+    # doctor 経由で exit 18 を propagate する可能性があるため、通常の
+    # LorebookError (2-17) 空間ではなく doctor の空間 (0/1/18) を尊重.
+    if getattr(args, "dry_run", False):
+        if not quiet:
+            print(IDENTITY_BANNER, file=sys.stderr)
+        return _run_dry_run(args, quiet=quiet)
 
     cfg = IngestConfig(
         input_dir=Path(args.input_dir),
@@ -750,6 +1305,14 @@ def run_ingest(args: argparse.Namespace) -> int:
         show_progress=not (
             getattr(args, "quiet", False) or getattr(args, "no_progress", False)
         ),
+        # U2: 入力探索オプション.
+        recursive=getattr(args, "recursive", False),
+        globs=_parse_globs_arg(getattr(args, "globs", None)),
+        # U3: encoding. 値のバリデーションは cli._validate_encoding_arg で
+        # 事前チェック済み. ここでは素通しで IngestConfig に載せる.
+        encoding=getattr(args, "encoding", "auto"),
+        # U6: opt-in post-swap SHA-256 照合.
+        verify_swap=getattr(args, "verify_swap", False),
     )
     # `--force-regenerate` と `--retry-failed` の共存: force 優先、retry は警告
     if cfg.force_regenerate and cfg.retry_failed:
@@ -781,36 +1344,96 @@ def run_ingest(args: argparse.Namespace) -> int:
                 return factory(existing_path)
             raise
 
+    # U5: started_at / completed_at / duration_seconds を run_report に
+    # 記録するため、IngestRunner の前後で wall-clock + monotonic を読む.
+    started_at_dt = datetime.now(timezone.utc).astimezone()
+    t0 = time.perf_counter()
     result = IngestRunner(
         cfg,
         analyzer_factory=_factory,
         llm_factory=get_client,
     ).run()
+    duration_seconds = time.perf_counter() - t0
+    completed_at_dt = datetime.now(timezone.utc).astimezone()
     for w in result.warnings:
         print(f"[warn] {w}", file=sys.stderr)
     for e in result.errors:
         print(f"[error] {e}", file=sys.stderr)
 
-    # F-036: success time に ingest_result.json を書き出し. JSON format 時は stdout にも出力.
-    summary = {
-        "exit_code": result.exit_code,
-        "chunks_generated": result.chunks_generated,
-        "total_input_files": result.total_input_files,
-        "skipped_files": result.skipped_files,
-        "warnings": list(result.warnings),
-        "errors": list(result.errors),
-        "output_dir": str(cfg.output_dir),
-    }
+    # U5: run_report.json を成功・失敗を問わず常に emit.
+    # `IngestResult.errors` は `{class, message, context}` dict なので
+    # exit_reason にそのまま使える.
+    from lorebook_chunker.run_report import RunReport, write as _write_run_report
+
+    exit_reason: dict[str, Any] | None = None
+    if result.exit_code != 0 and result.errors:
+        exit_reason = dict(result.errors[0])
+
+    wiki_stats = result.wiki_stats
+    llm_model_id = (wiki_stats.llm_model_id if wiki_stats else "") or ""
+    if not llm_model_id and cfg.skip_wiki:
+        llm_model_id = "noop@skip-wiki"
+    wiki_pages_written = wiki_stats.succeeded if wiki_stats else 0
+
+    report = RunReport(
+        exit_code=result.exit_code,
+        exit_reason=exit_reason,
+        started_at=started_at_dt.isoformat(),
+        completed_at=completed_at_dt.isoformat(),
+        duration_seconds=duration_seconds,
+        phase_durations_seconds=dict(result.phase_timings),
+        input={
+            "input_dir": str(cfg.input_dir),
+            "recursive": bool(cfg.recursive),
+            "globs": list(cfg.globs),
+            "encoding_option": cfg.encoding,
+            "files_processed": result.total_input_files - result.skipped_files,
+            "files_skipped": [sr.to_jsonable() for sr in result.skips],
+        },
+        output={
+            "output_dir": str(cfg.output_dir),
+            "chunks_generated": result.chunks_generated,
+            "entities_generated": result.entities_generated,
+            "wiki_pages_written": int(wiki_pages_written),
+        },
+        analyzer=_build_analyzer_meta(cfg.output_dir),
+        llm={
+            "backend": cfg.llm_backend,
+            "model_id": llm_model_id,
+            "total_input_tokens": wiki_stats.total_input_tokens if wiki_stats else 0,
+            "total_output_tokens": wiki_stats.total_output_tokens if wiki_stats else 0,
+        },
+        warnings=list(result.warnings),
+    )
+    report_dict = report.to_json_dict()
+    # Writer はエラー時も含めて常に試みる. 失敗なら RunReportError (exit 17) に
+    # 置換するが、既に非 0 exit で終わっている場合は元の exit_code を優先する
+    # (writer 失敗が一次失敗を mask しないため).
+    try:
+        _write_run_report(cfg.output_dir / "run_report.json", report)
+    except Exception as write_err:  # RunReportError 含む
+        if result.exit_code == 0:
+            # 成功 run で writer だけが失敗した場合 → exit 17 に昇格.
+            from lorebook_chunker.errors import RunReportError
+
+            if not isinstance(write_err, RunReportError):
+                write_err = RunReportError(
+                    f"run_report.json write failed: {write_err}",
+                    path=str(cfg.output_dir / "run_report.json"),
+                    reason=type(write_err).__name__,
+                )
+            result.exit_code = write_err.exit_code
+            result.errors.append(write_err.to_jsonable())
+            print(f"[error] {write_err}", file=sys.stderr)
+        else:
+            # 既に失敗している run は元の exit_code を維持し、writer 失敗は
+            # warning として stderr にだけ残す.
+            logger.warning("failed to write run_report.json: %s", write_err)
+
     fmt = getattr(args, "format", "human")
     if result.exit_code == 0:
-        try:
-            (cfg.output_dir / "ingest_result.json").write_text(
-                json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-        except OSError as e:  # pragma: no cover
-            logger.warning("failed to write ingest_result.json: %s", e)
         if fmt == "json":
-            print(json.dumps(summary, ensure_ascii=False))
+            print(json.dumps(report_dict, ensure_ascii=False))
         elif not quiet:
             print(
                 f"ingest OK: {result.chunks_generated} chunks from "
@@ -819,5 +1442,5 @@ def run_ingest(args: argparse.Namespace) -> int:
             )
     else:
         if fmt == "json":
-            print(json.dumps(summary, ensure_ascii=False))
+            print(json.dumps(report_dict, ensure_ascii=False))
     return result.exit_code

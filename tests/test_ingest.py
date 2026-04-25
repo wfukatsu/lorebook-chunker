@@ -4,89 +4,16 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import pytest
 
-from lorebook_chunker.chunker import simple_japanese_splitter
 from lorebook_chunker.ingest import IngestConfig, IngestRunner, run_ingest
 from lorebook_chunker.llm import GenerateResult, LLMPermanentError
-from lorebook_chunker.schema import AnalyzerConfig, EntityMention
+from lorebook_chunker.schema import EntityMention
 
-
-class _StubAnalyzer:
-    """Ginza 非依存の stub. simple_japanese_splitter を使い、固定の NER を返す."""
-
-    def __init__(self, entity_map: dict[str, list[EntityMention]] | None = None) -> None:
-        self._entities = entity_map or {}
-
-    def iter_sentences(self, text: str) -> Iterable[str]:
-        return simple_japanese_splitter(text)
-
-    def iter_entities(self, text: str) -> Iterable[EntityMention]:
-        # 入力 text の最初のキー (substring) がマッチすればそのエンティティを返す
-        for key, ents in self._entities.items():
-            if key in text:
-                yield from ents
-
-    def tokenize_for_tfidf(self, text: str) -> list[str]:
-        # シンプルな tokenization: 句点/空白で分割 + 2 文字以上
-        tokens: list[str] = []
-        for chunk in text.replace("\n", "。").split("。"):
-            for word in chunk.split():
-                w = word.strip("、.,")
-                if len(w) >= 2:
-                    tokens.append(w)
-        # 漢字語も強引に混ぜる (文字ベースの simple tokenizer)
-        for word in ["田中", "佐藤", "スカラー商事", "東京", "大阪", "プロジェクト"]:
-            count = text.count(word)
-            for _ in range(count):
-                tokens.append(word)
-        return tokens
-
-    def save(self, path) -> None:
-        # analyzer.json を書き出す (strict_match / compat_match の最小限)
-        config = AnalyzerConfig(
-            strict_match={
-                "model_name": "stub",
-                "split_mode": "STUB",
-                "pos_allowlist": ["NOUN"],
-                "stopwords": [],
-                "lemma_rules": "stub",
-                "normalization": {"nfkc": True, "lf_only": True, "strip_trailing": True, "collapse_spaces": True},
-                "sudachidict_binary_sha256": "stub",
-                "model_checksum": "stub",
-            },
-            compat_match={"ginza": "stub-0.0", "spacy": "stub-0.0", "sudachipy": "stub-0.0"},
-            tfidf={"min_df": 1, "max_df": 0.95},
-        )
-        Path(path).write_text(
-            json.dumps(config.to_dict(), ensure_ascii=False), encoding="utf-8"
-        )
-
-    def build_config(self) -> AnalyzerConfig:
-        return AnalyzerConfig(
-            strict_match={"model_name": "stub"},
-            compat_match={"ginza": "stub-0.0"},
-            tfidf={},
-        )
-
-
-class _ScriptedLLM:
-    model_id = "mock@v1"
-
-    def __init__(self, responses: list) -> None:
-        self._responses = list(responses)
-        self.calls = 0
-
-    def generate(self, prompt: str, max_tokens: int) -> GenerateResult:
-        self.calls += 1
-        r = self._responses.pop(0) if self._responses else GenerateResult(
-            text="OK", input_tokens=5, output_tokens=5, model_id="mock@v1", finish_reason="end_turn"
-        )
-        if isinstance(r, Exception):
-            raise r
-        return r
+# U2: stub クラスは tests/conftest.py に集約.
+from tests.conftest import _ScriptedLLM, _StubAnalyzer
 
 
 def _ok(text: str = "OK") -> GenerateResult:
@@ -202,8 +129,9 @@ def test_ingest_fails_on_empty_input_dir(tmp_path: Path) -> None:
         llm_factory=lambda backend, config: _ScriptedLLM([]),
     )
     result = runner.run()
-    assert result.exit_code != 0
-    assert any("no .txt" in e for e in result.errors)
+    assert result.exit_code == 2  # ConfigError(no_input_files) per U1
+    # result.errors is now list[dict] ({"class", "message", "context"}) per U1
+    assert any("no .txt" in e["message"] for e in result.errors)
 
 
 def test_ingest_skips_empty_and_bad_utf8_files(tmp_path: Path) -> None:
@@ -217,9 +145,15 @@ def test_ingest_skips_empty_and_bad_utf8_files(tmp_path: Path) -> None:
     )
     output_dir = tmp_path / "out"
 
+    # U3: `[full]` extra で charset-normalizer が入った環境では、bad UTF-8
+    # bytes が Shift-JIS / CP932 として auto 検出される可能性があり、
+    # `--encoding auto` default だと skip されず warning も消える (既存
+    # assertion "utf-8 decode failed" が壊れる). ここでは `encoding="utf-8"`
+    # 明示で strict decode に固定し、charset-normalizer 有無に依存しない
+    # 決定的挙動を要求する.
     cfg = IngestConfig(
         input_dir=input_dir, output_dir=output_dir, skip_wiki=True, target_chars=20,
-        max_chunk_chars=100,
+        max_chunk_chars=100, encoding="utf-8",
     )
     runner = IngestRunner(
         cfg,
@@ -231,6 +165,11 @@ def test_ingest_skips_empty_and_bad_utf8_files(tmp_path: Path) -> None:
     assert result.skipped_files == 2
     assert any("empty file" in w for w in result.warnings)
     assert any("utf-8 decode failed" in w for w in result.warnings)
+    # U4: 構造化 skip レコードも 2 件, reason が enum-like 値で適切に区別される
+    assert len(result.skips) == 2
+    reasons = {sr.reason for sr in result.skips}
+    assert "empty_file" in reasons
+    assert reasons & {"encoding_decode_failed", "encoding_detection_failed"}
 
 
 def test_ingest_openai_backend_fails_fast(tmp_path: Path) -> None:
@@ -253,8 +192,9 @@ def test_ingest_openai_backend_fails_fast(tmp_path: Path) -> None:
         llm_factory=get_client,
     )
     result = runner.run()
-    assert result.exit_code != 0
-    assert any("OpenAI" in e or "v2" in e for e in result.errors)
+    assert result.exit_code == 3  # LLMBackendUnavailableError (preflight) per U1
+    # result.errors is now list[dict] per U1
+    assert any("OpenAI" in e["message"] or "v2" in e["message"] for e in result.errors)
 
 
 def test_ingest_atomic_swap_replaces_existing(tmp_path: Path) -> None:

@@ -18,7 +18,7 @@ from lorebook_chunker.ingest import IngestConfig, IngestRunner, run_ingest
 from lorebook_chunker.lint import FATAL, run_lint_impl
 from lorebook_chunker.query import run_query_impl
 from lorebook_chunker.schema import EntityMention
-from tests.test_ingest import _ScriptedLLM, _StubAnalyzer
+from tests.conftest import _ScriptedLLM, _StubAnalyzer
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURE_SAMPLES = REPO_ROOT / "tests" / "fixtures" / "samples"

@@ -33,6 +33,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# ----------------------------------------------------------------------
+# インストールプロファイル (5 種類). 組み合わせ可.
+#
+#   minimal : `pip install lorebook-chunker`            (extra 無し, UTF-8 only)
+#   fast    : `pip install lorebook-chunker[fast]`      + ja_ginza 軽量モデル
+#   full    : `pip install lorebook-chunker[full]`      + charset-normalizer
+#   bench   : `pip install lorebook-chunker[bench]`     + ranx (RAG 評価)
+#   dev     : `pip install lorebook-chunker[dev]`       + pytest (コントリビュータ)
+#
+# 詳細は README「インストール > 推奨プロファイル」を参照.
+# ----------------------------------------------------------------------
 dev = [
     "pytest>=8",
     "pytest-mock>=3",
@@ -42,6 +53,18 @@ dev = [
 # `pip install -e '.[fast]'` で opt-in.
 fast = [
     "ja_ginza>=5.2,<6",
+]
+# U3: `--encoding auto` の検出器フォールバック (Shift-JIS / CP932 / EUC-JP 等).
+# 未導入環境では utf-8-sig しか通らず非 UTF-8 は skip される. `[full]` extra
+# で opt-in することで charset-normalizer による検出が有効になる.
+full = [
+    "charset-normalizer>=3.4",
+]
+# U7/U9: RAG 検索評価ベンチマーク. `scripts/bench.py` (U9) が ranx を使う.
+# `pip install -e '.[bench]'` で opt-in. 本ベンチマークは自前コーパスの
+# チューニング / regression 検出用途であり、ツール間比較は対象外.
+bench = [
+    "ranx>=0.3",
 ]
 
 [project.scripts]

@@ -2,25 +2,27 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import sys
 from typing import Sequence
+
+from .errors import ConfigError, describe_exit_codes
 
 IDENTITY_BANNER = (
     "lorebook-chunker: 日本語 RAG 前処理・コーパス健全性・一級エンティティ知識ベース生成ツール "
     "(本番検索は下流 vector store で行う前提)"
 )
 
-INGEST_EPILOG = """\
-exit codes:
-  0   success
-  2   no input .txt files under input_dir
-  3   LLM backend unavailable (permanent error at init)
-  4   analyzer init failed
-  5   chunking produced zero chunks
-  6   wiki generation aborted (systemic failure detected)
-  10  unexpected error (see log / stderr)
-"""
+# ingest は LorebookError 階層を通じて exit code を決定するため、
+# epilog は errors.describe_exit_codes() から生成 (single source of truth).
+INGEST_EPILOG = describe_exit_codes()
 
+# NOTE: lint / query の exit code は LorebookError 階層とは別 namespace の
+# subcommand-local semantics:
+#   lint  — 0/1/2 (clean / warnings / fatal) の severity 集計
+#   query — 0/2/3/4 (hit / missing / corrupted / no-match)  の検索結果
+# ingest の LorebookError exit code (0, 2-6, 10-17) と衝突しないが、
+# 意味も異なるので errors.py に混ぜず subcommand ごとにハードコードする.
 LINT_EPILOG = """\
 exit codes:
   0  no fatal and no warning findings
@@ -47,6 +49,33 @@ def _add_ingest(subparsers: argparse._SubParsersAction) -> None:
     )
     p.add_argument("input_dir", help="入力ディレクトリ (.txt を含む)")
     p.add_argument("output_dir", help="出力ディレクトリ (破壊的全再生成)")
+    p.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="入力ディレクトリをサブディレクトリまで再帰的に探索する (既定: トップレベルのみ)",
+    )
+    p.add_argument(
+        "--glob",
+        dest="globs",
+        default="*.txt",
+        metavar="PATTERN",
+        help=(
+            "入力ファイルを絞り込む glob パターン. カンマ区切りで複数指定可 "
+            "(例: '*.txt,*.md'). 既定: '*.txt'. 絶対パスや空文字は不可."
+        ),
+    )
+    p.add_argument(
+        "--encoding",
+        default="auto",
+        metavar="NAME",
+        help=(
+            "入力ファイルのエンコーディング. 'auto' (既定) は utf-8-sig を試し、"
+            "失敗時は charset-normalizer ([full] extra 導入時のみ) で検出. "
+            "明示指定は strict decode: 'utf-8' / 'utf-8-sig' / 'cp932' / "
+            "'shift_jis' / 'euc_jp' など Python codec 名."
+        ),
+    )
     p.add_argument("--skip-wiki", action="store_true", help="エンティティ wiki 生成をスキップ")
     p.add_argument("--max-llm-calls", type=int, default=None, help="LLM 呼び出しの上限 (entity 試行のみ, pre-flight は除外)")
     p.add_argument("--force-regenerate", action="store_true", help="全 wiki を無条件再生成")
@@ -112,6 +141,26 @@ def _add_ingest(subparsers: argparse._SubParsersAction) -> None:
         "--no-progress",
         action="store_true",
         help="stderr への進捗表示を抑止 (--quiet でも自動で off)",
+    )
+    p.add_argument(
+        "--verify-swap",
+        action="store_true",
+        help=(
+            "出力ディレクトリ切替後に staging/target の SHA-256 照合を実施する (opt-in). "
+            "同一 FS 上では os.replace が inode 操作のため tautological; "
+            "主に cross-device (EXDEV) 経路での破損検知に意味を持つ. "
+            "数秒〜数十秒のオーバーヘッド."
+        ),
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "事前検証のみ実行: doctor サブコマンドの環境チェック + 入力ファイル探索 + "
+            "先頭ファイルの encoding probe (64 KiB sample). "
+            "出力ディレクトリは作成せず、stdout に JSON サマリを出力. "
+            "doctor が critical failure を返した場合はその exit 18 を propagate する."
+        ),
     )
 
 
@@ -218,6 +267,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_ingest(subparsers)
     _add_query(subparsers)
     _add_lint(subparsers)
+    # doctor は ingest 系とは別 exit code 空間 (0/1/18) を使うため、
+    # subparser 登録のみ cli.py 側で行い、引数定義は doctor.py に委譲する.
+    from lorebook_chunker.doctor import add_doctor_subparser
+    add_doctor_subparser(subparsers)
     return parser
 
 
@@ -234,6 +287,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "lint":
         from lorebook_chunker.lint import run_lint
         return run_lint(args)
+    if args.command == "doctor":
+        from lorebook_chunker.doctor import run_doctor
+        return run_doctor(args)
 
     parser.print_help(sys.stderr)
     return 2
